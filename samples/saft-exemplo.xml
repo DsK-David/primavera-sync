@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<AuditFile xmlns="urn:OECD:StandardAuditFile-Tax:PT_1.04_01">
+  <MasterFiles>
+    <Customer><CustomerID>C001</CustomerID><CustomerTaxID>500000001</CustomerTaxID><CompanyName>Alfa Lda</CompanyName></Customer>
+    <Customer><CustomerID>C002</CustomerID><CustomerTaxID>500000002</CustomerTaxID><CompanyName>Beta SA</CompanyName></Customer>
+  </MasterFiles>
+  <SourceDocuments>
+    <SalesInvoices>
+      <Invoice><InvoiceNo>FT 2026/1</InvoiceNo><DocumentStatus><InvoiceStatus>N</InvoiceStatus></DocumentStatus><InvoiceDate>2026-07-05</InvoiceDate><InvoiceType>FT</InvoiceType><CustomerID>C001</CustomerID>
+        <DocumentTotals><TaxPayable>230.00</TaxPayable><NetTotal>1000.00</NetTotal><GrossTotal>1230.00</GrossTotal></DocumentTotals></Invoice>
+      <Invoice><InvoiceNo>FT 2026/2</InvoiceNo><DocumentStatus><InvoiceStatus>N</InvoiceStatus></DocumentStatus><InvoiceDate>2026-08-10</InvoiceDate><InvoiceType>FT</InvoiceType><CustomerID>C002</CustomerID>
+        <DocumentTotals><TaxPayable>115.00</TaxPayable><NetTotal>500.00</NetTotal><GrossTotal>615.00</GrossTotal></DocumentTotals></Invoice>
+      <Invoice><InvoiceNo>FT 2026/3</InvoiceNo><DocumentStatus><InvoiceStatus>N</InvoiceStatus></DocumentStatus><InvoiceDate>2026-09-15</InvoiceDate><InvoiceType>FT</InvoiceType><CustomerID>C001</CustomerID>
+        <DocumentTotals><TaxPayable>69.00</TaxPayable><NetTotal>300.00</NetTotal><GrossTotal>369.00</GrossTotal></DocumentTotals></Invoice>
+      <Invoice><InvoiceNo>FT 2026/4</InvoiceNo><DocumentStatus><InvoiceStatus>A</InvoiceStatus></DocumentStatus><InvoiceDate>2026-09-20</InvoiceDate><InvoiceType>FT</InvoiceType><CustomerID>C002</CustomerID>
+        <DocumentTotals><TaxPayable>23.00</TaxPayable><NetTotal>100.00</NetTotal><GrossTotal>123.00</GrossTotal></DocumentTotals></Invoice>
+    </SalesInvoices>
+    <Payments>
+      <Payment><PaymentRefNo>RG 2026/1</PaymentRefNo><TransactionDate>2026-07-20</TransactionDate><PaymentType>RG</PaymentType><CustomerID>C001</CustomerID>
+        <Line><SourceDocumentID><OriginatingON>FT 2026/1</OriginatingON></SourceDocumentID><CreditAmount>1230.00</CreditAmount></Line>
+        <DocumentTotals><GrossTotal>1230.00</GrossTotal></DocumentTotals></Payment>
+      <Payment><PaymentRefNo>RG 2026/2</PaymentRefNo><TransactionDate>2026-09-01</TransactionDate><PaymentType>RG</PaymentType><CustomerID>C002</CustomerID>
+        <Line><SourceDocumentID><OriginatingON>FT 2026/2</OriginatingON></SourceDocumentID><CreditAmount>300.00</CreditAmount></Line>
+        <DocumentTotals><GrossTotal>300.00</GrossTotal></DocumentTotals></Payment>
+    </Payments>
+  </SourceDocuments>
+</AuditFile>

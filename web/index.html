@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Primavera Sync</title>
+<style>
+  :root { --bg:#f6f7f9; --fg:#1b1f24; --card:#fff; --muted:#6b7280; --line:#e5e7eb; --accent:#2563eb; --warn:#b45309; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0f1115; --fg:#e5e7eb; --card:#181b21; --muted:#9ca3af; --line:#2a2f38; --accent:#60a5fa; --warn:#fbbf24; } }
+  * { box-sizing:border-box } body { margin:0; padding:24px 16px; background:var(--bg); color:var(--fg); font:15px system-ui, sans-serif }
+  main { max-width:1000px; margin:0 auto } h1 { margin:0 0 16px; font-size:22px } h2 { font-size:16px; margin:0 0 12px }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:16px }
+  .card, section { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px }
+  .card small { color:var(--muted); display:block; margin-bottom:4px } .card b { font-size:20px }
+  section { margin-bottom:16px; overflow-x:auto } table { width:100%; border-collapse:collapse }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); white-space:nowrap } th { color:var(--muted); font-weight:500 }
+  td.n, th.n { text-align:right; font-variant-numeric:tabular-nums } .warn { color:var(--warn) }
+  .bars { display:flex; align-items:flex-end; gap:10px; height:140px } .bar { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:flex-end; height:100%; font-size:12px; color:var(--muted) }
+  .bar i { width:100%; background:var(--accent); border-radius:4px 4px 0 0; display:block }
+</style>
+</head>
+<body>
+<main>
+  <h1>Faturas e recibos</h1>
+  <div class="cards" id="cards"></div>
+  <section><h2>Faturado por mês</h2><div class="bars" id="bars"></div></section>
+  <section><h2>Por cliente</h2><table id="customers"></table></section>
+  <section><h2>Faturas em aberto</h2><table id="open"></table></section>
+</main>
+<script>
+const eur = v => new Intl.NumberFormat('pt-PT', {style:'currency', currency:'EUR'}).format(v);
+const get = u => fetch(u).then(r => r.json());
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function table(el, head, rows) {
+  el.innerHTML = '<tr>' + head.map(h => `<th class="${h[1] ? 'n' : ''}">${h[0]}</th>`).join('') + '</tr>' +
+    rows.map(r => '<tr>' + r.map((c, i) => `<td class="${head[i][1] ? 'n' : ''}">${c}</td>`).join('') + '</tr>').join('');
+}
+Promise.all([get('/api/summary'), get('/api/monthly'), get('/api/customers'), get('/api/open')]).then(([s, m, c, o]) => {
+  const cards = [['Faturado (c/ IVA)', eur(s.invoiced_gross)], ['IVA', eur(s.invoiced_tax)], ['Recebido', eur(s.received)],
+    ['Em aberto', eur(s.open_total)], ['Faturas', s.invoices_count], ['Recibos', s.receipts_count]];
+  document.getElementById('cards').innerHTML = cards.map(([k, v]) => `<div class="card"><small>${k}</small><b>${v}</b></div>`).join('');
+  const max = Math.max(1, ...m.map(x => x.invoiced));
+  document.getElementById('bars').innerHTML = m.map(x =>
+    `<div class="bar" title="${eur(x.invoiced)}"><i style="height:${x.invoiced / max * 100}%"></i>${esc(x.month)}</div>`).join('');
+  table(document.getElementById('customers'), [['Cliente'], ['Faturado', 1], ['Pago', 1], ['Em aberto', 1]],
+    c.map(x => [esc(x.customer), eur(x.invoiced), eur(x.paid), eur(x.open_amount)]));
+  table(document.getElementById('open'), [['Fatura'], ['Data'], ['Cliente'], ['Total', 1], ['Em aberto', 1], ['Dias', 1]],
+    o.map(x => [esc(x.number), esc(x.date), esc(x.customer), eur(x.gross_total), eur(x.open_amount),
+      `<span class="${x.days_open > 30 ? 'warn' : ''}">${x.days_open}</span>`]));
+});
+</script>
+</body>
+</html>
