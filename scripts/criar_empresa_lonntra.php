@@ -7,16 +7,22 @@
  * A empresa fica SEM credenciais do e-Fatura (IAM_CLIENT_ID, IAM_CLIENT_SECRET, LED_CODE): os documentos já
  * foram emitidos e comunicados pelo Primavera, a Lonntra não os pode voltar a comunicar (Envio::faturasPorEnviar).
  *
- * Uso: php scripts/criar_empresa_lonntra.php <pasta da Lonntra> "<nome>" <NIF> [utilizador]
+ * Uso: php scripts/criar_empresa_lonntra.php <pasta da Lonntra> "<nome>" <NIF> [utilizador] [repositório]
+ * repositório do e-Fatura: 1 Principal (empresa real, em produção), 2 Homologação, 3 Teste (por defeito)
  * Ex.: php scripts/criar_empresa_lonntra.php ../ilhapay "Auto Style" 299999970 david.silva
  */
 
 if ($argc < 4) {
-    fwrite(STDERR, "uso: php scripts/criar_empresa_lonntra.php <pasta da Lonntra> \"<nome>\" <NIF> [utilizador]\n");
+    fwrite(STDERR, "uso: php scripts/criar_empresa_lonntra.php <pasta da Lonntra> \"<nome>\" <NIF> [utilizador] [repositório 1|2|3]\n");
     exit(1);
 }
 [, $pasta, $nome, $nif] = $argv;
 $utilizador = $argv[4] ?? 'david.silva';
+$repositorio = $argv[5] ?? '3';
+if (!in_array($repositorio, ['1', '2', '3'], true)) {
+    fwrite(STDERR, "O repositório tem de ser 1 (Principal), 2 (Homologação) ou 3 (Teste).\n");
+    exit(1);
+}
 $pasta = realpath($pasta);
 
 defined('YII_DEBUG') or define('YII_DEBUG', false);
@@ -65,7 +71,7 @@ try {
             'IAM_CLIENT_ID' => null,
             'IAM_CLIENT_SECRET' => null,
             'LED_CODE' => null,
-            'REPOSITORIO' => '3',        // Teste
+            'REPOSITORIO' => $repositorio,
             'FLAG_DEMO' => 'N',
         ], false);
         $m->isNewRecord = true;
