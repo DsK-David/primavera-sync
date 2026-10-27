@@ -1,4 +1,4 @@
-# Instalar e manter o primavera-sync na Auto Style
+# Instalar e manter o primavera-sync (Auto Style e outros clientes)
 
 O primavera-sync corre no servidor da Auto Style, lê o Primavera (só leitura) e envia para a Lonntra (https://app.lonntra.cv):
 
@@ -9,6 +9,48 @@ O primavera-sync corre no servidor da Auto Style, lê o Primavera (só leitura) 
 Na Lonntra tudo fica só para consulta: o stock e os documentos continuam a ser geridos no Primavera.
 
 A cada minuto, o sync dá **sinal de vida** à Lonntra. Se parar mais de 2 horas, ou se tiver registos com erro, a Lonntra **avisa no sino** (e por email, se estiver ligado), e avisa outra vez quando voltar a funcionar.
+
+---
+
+## Instalação rápida (recomendada)
+
+O `instalar.bat` faz sozinho tudo o que a Parte C descreve à mão.
+
+**No Mac, antes de ir** (uma vez por cliente):
+
+1. Parte A: Lonntra atualizada, empresa criada, chave gerada, vigia ligado.
+2. Copiar o `cliente.example.ini` para `clientes/<cliente>/cliente.ini` e preencher o nome, o NIF, o URL e a chave. A pasta `clientes/` não vai para o Git. A da Auto Style já está em `clientes/auto-style/cliente.ini`.
+
+**No servidor do cliente** (pelo AnyDesk, com um utilizador administrador):
+
+1. Descarregar o ZIP do primavera-sync (GitHub, ramo `main`) e extrair, por exemplo para o Ambiente de Trabalho.
+2. Copiar o `cliente.ini` do cliente para dentro dessa pasta, ao lado do `instalar.bat` (pela transferência de ficheiros do AnyDesk).
+3. Fazer duplo clique em **`instalar.bat`** e aceitar o pedido de administrador.
+
+O instalador, por esta ordem:
+
+| Passo | O que faz | O que pode perguntar |
+|---|---|---|
+| Ficheiros | copia o sync para `C:\primavera-sync` e fecha a pasta só para administradores | — |
+| Python | instala o Python 3.12 (se faltar) e o pyodbc; confirma o driver ODBC | — |
+| Lonntra | testa a chave do `cliente.ini` | a chave, se faltar ou estiver errada |
+| SQL Server | encontra a instância e entra com o utilizador do Windows | o login de administrador (ex.: `sa`), só se o Windows não entrar; não fica guardado |
+| Empresa | lista as bases `PRI…` com o nome da empresa | qual é, se houver várias |
+| Acesso | cria o login `lonntra_leitura` (só leitura, palavra-passe gerada) ou, se o SQL Server só aceitar Windows, dá leitura à conta SYSTEM | — |
+| Códigos | mostra os tipos de documento e propõe FT/FR/TV/NC/ND; propõe os métodos de pagamento; mostra os tipos de artigo com exemplos | confirmar os tipos (Enter); quais tipos de artigo são serviços |
+| Stock | experimenta as consultas do catálogo e do stock; desliga o que não existir nesta versão e diz que tabelas há | — |
+| Histórico | — | enviar já ou à noite (por omissão: entre as 20h e as 7h) |
+| Verificação | escreve o `config.ini` e corre o `--verificar` | — |
+| Arranque | cria a tarefa «PrimaveraLonntra» (com o Windows, como SYSTEM, reinicia se parar), arranca-a e espera pelo primeiro ciclo | — |
+
+No fim mostra o resultado, que também fica em `C:\primavera-sync\relatorio-instalacao.txt`. Se algum passo falhar, diz porquê; corrige-se e volta a correr-se o `instalar.bat` (é seguro repetir).
+
+Depois, na pasta `C:\primavera-sync`:
+
+- **`estado.bat`**: estado da tarefa, verificação, o que foi enviado, os erros e o fim do log;
+- **`desinstalar.bat`**: para e remove o arranque automático (os ficheiros ficam).
+
+A Parte C abaixo é a instalação à mão, para quando o instalador não puder ser usado ou para perceber o que ele faz.
 
 ---
 
@@ -298,8 +340,9 @@ mkdir logs
 | Testar tudo, sem enviar | `python -m primavera_sync.sincronizador config.ini --verificar` |
 | Ver o que foi enviado e os erros | `python -m primavera_sync.sincronizador config.ini --estado` |
 | Ver o log | `Get-Content primavera-sync.log -Tail 50` |
-| Estado do serviço | `Get-Service PrimaveraLonntra` |
-| Parar / arrancar / reiniciar | `.\nssm.exe stop PrimaveraLonntra` / `start` / `restart` |
+| Estado | `estado.bat` (instalação rápida) ou `Get-Service PrimaveraLonntra` (à mão, com o NSSM) |
+| Parar / arrancar (instalação rápida) | `Stop-ScheduledTask PrimaveraLonntra` / `Start-ScheduledTask PrimaveraLonntra` |
+| Parar / arrancar (à mão, com o NSSM) | `.\nssm.exe stop PrimaveraLonntra` / `start` / `restart` |
 | Voltar a tentar os que esgotaram as 5 tentativas | parar o serviço → `python -m primavera_sync.sincronizador config.ini --repetir-erros --uma-vez` → arrancar o serviço |
 | Rever tudo (ex.: depois de corrigir uma consulta) | parar o serviço → `python -m primavera_sync.sincronizador config.ini --uma-vez --completo` → arrancar |
 

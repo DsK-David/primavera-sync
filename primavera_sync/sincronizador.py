@@ -40,6 +40,10 @@ CREATE TABLE IF NOT EXISTS catalogo (
     valor TEXT NOT NULL,           -- o que foi enviado (impressão do artigo, nome, quantidade)
     PRIMARY KEY (tipo, chave)
 );
+CREATE TABLE IF NOT EXISTS marcas (
+    chave TEXT PRIMARY KEY,        -- ex.: carga_documentos (o histórico já foi todo enviado)
+    valor TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS erros (
     documento TEXT PRIMARY KEY,
     numero TEXT NOT NULL,
@@ -90,6 +94,14 @@ class Estado:
         with self.conn:
             self.conn.executemany("INSERT OR REPLACE INTO catalogo VALUES (?,?,?)", [(tipo, k, v) for k, v in valores.items()])
             self.conn.executemany("DELETE FROM erros WHERE documento=?", [(f"{tipo}:{k}",) for k in valores])
+
+    def marca(self, chave):
+        r = self.conn.execute("SELECT valor FROM marcas WHERE chave=?", (chave,)).fetchone()
+        return r[0] if r else None
+
+    def marcar_marca(self, chave, valor):
+        with self.conn:
+            self.conn.execute("INSERT OR REPLACE INTO marcas VALUES (?,?)", (chave, valor))
 
     def vazio(self):
         return self.conn.execute("SELECT 1 FROM enviados LIMIT 1").fetchone() is None
@@ -160,6 +172,35 @@ class Sincronizador:
                 log.exception("Catálogo ou stock: erro; os documentos continuam. Ver [consultas] no config.ini.")
         return self.documentos(completo)
 
+    # ---- histórico: a primeira carga é completa, depois só o recente
+
+    def _historico(self, tipo, completo):
+        """(desde, a carga completa vai ser feita agora?) para «documentos» ou «movimentos».
+
+        A carga completa faz-se uma vez (sozinha, sem --completo) e, se houver `historico_horario` (ex.: 20-7), só
+        dentro desse horário: durante o dia vai só o recente, para não pesar no Primavera.
+        """
+        inicio = self.s.get("data_inicio", "").strip()
+        alvo = inicio or "tudo"
+        if completo or (self.estado.marca(f"carga_{tipo}") != alvo and self._na_janela()):
+            return (date.fromisoformat(inicio) if inicio else None), True
+        desde = date.today() - timedelta(days=self.s.getint("revisao_dias", 30))
+        if inicio and date.fromisoformat(inicio) > desde:
+            desde = date.fromisoformat(inicio)
+        return desde, False
+
+    def _carga_feita(self, tipo):
+        self.estado.marcar_marca(f"carga_{tipo}", self.s.get("data_inicio", "").strip() or "tudo")
+        log.info("Carga completa de %s feita.", tipo)
+
+    def _na_janela(self, agora=None):
+        janela = self.s.get("historico_horario", "").strip()
+        if not janela:
+            return True
+        de, ate = (int(x) for x in janela.split("-"))
+        hora = (agora or datetime.now()).hour
+        return de <= hora < ate if de < ate else hora >= de or hora < ate
+
     # ---- catálogo e stock (ADR-061, fase 3)
 
     def catalogo(self, completo=False):
@@ -216,10 +257,11 @@ class Sincronizador:
             self.estado.guardar_catalogo("armazem", novos)
             r["armazens"] = len(novos)
 
+        movimentos_ativos = _txt(self.s.get("movimentos_stock", "sim")).lower() not in ("nao", "não", "no", "false", "0", "off")
         feitos = self.estado.catalogo("movimento")
-        desde = date(1900, 1, 1) if completo or not feitos else date.today() - timedelta(days=self.s.getint("revisao_dias", 30))
+        desde, carga = self._historico("movimentos", completo)
         movimentos = []
-        for m in self.fonte.movimentos(desde):
+        for m in (self.fonte.movimentos(desde or date(1900, 1, 1)) if movimentos_ativos else []):
             if m["Id"] in feitos or _num(m.get("Quantidade")) == 0:
                 continue
             tipo = _txt(m.get("EntradaSaida")).upper()[:1]
@@ -232,6 +274,8 @@ class Sincronizador:
             erros = self._erros("movimento", self.lonntra.stock(movimentos=parte))
             self.estado.guardar_catalogo("movimento", {m["id"]: "" for m in parte if m["id"] not in erros})
             r["movimentos"] += len(parte) - len(erros)
+        if carga and movimentos_ativos:
+            self._carga_feita("movimentos")
 
         feitos = self.estado.catalogo("existencia")
         existencias = {}
@@ -263,17 +307,14 @@ class Sincronizador:
     # ---- documentos
 
     def documentos(self, completo=False):
-        desde = None
-        if not completo and not self.estado.vazio():
-            desde = date.today() - timedelta(days=self.s.getint("revisao_dias", 30))
-        inicio = self.s.get("data_inicio", "").strip()
-        if inicio and (desde is None or date.fromisoformat(inicio) > desde):
-            desde = date.fromisoformat(inicio)
+        desde, carga = self._historico("documentos", completo)
 
         feitos, tentativas = self.estado.enviados(), self.estado.tentativas()
         docs = [d for d in self.fonte.documentos(list(self.tipos), desde)
                 if d["Id"] not in feitos and tentativas.get(d["Id"], 0) < self.max_tentativas]
         if not docs:
+            if carga:
+                self._carga_feita("documentos")
             log.info("Nada de novo no Primavera.")
             return {"documentos": 0, "erros": 0}
         log.info("%d documento(s) por enviar%s.", len(docs), f" desde {desde}" if desde else "")
@@ -299,6 +340,8 @@ class Sincronizador:
                 log.warning("%s: %s", numero, aviso)
             log.info("%s %s.", numero, "já estava na Lonntra" if r.get("ja_existia") else "enviado")
             enviados += 1
+        if carga:
+            self._carga_feita("documentos")
         log.info("Ciclo terminado: %d enviado(s), %d com erro.", enviados, erros)
         return {"documentos": enviados, "erros": erros}
 

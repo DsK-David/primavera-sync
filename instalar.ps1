@@ -1,0 +1,125 @@
+﻿# Instalador do primavera-sync (Primavera ERP Evolution -> Lonntra). Corre-se com o instalar.bat (como administrador).
+#
+#  1. copia o sync para C:\primavera-sync (o config.ini e o estado.db que lá estejam ficam)
+#  2. instala o Python 3.12 (se faltar) e o pyodbc
+#  3. corre o assistente (python -m primavera_sync.instalar): descobre o Primavera, cria o login de leitura,
+#     propõe os mapas, escreve o config.ini e verifica tudo
+#  4. cria a tarefa «PrimaveraLonntra» (arranca com o Windows, como SYSTEM, e reinicia se parar) e arranca-a
+#  5. espera pelo primeiro ciclo e mostra o resultado; tudo fica em relatorio-instalacao.txt
+param([string]$Destino = "C:\primavera-sync")
+
+$ErrorActionPreference = "Stop"
+$Tarefa = "PrimaveraLonntra"
+$PythonUrl = "https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe"
+
+function Titulo($t) { Write-Host ""; Write-Host "== $t" -ForegroundColor Cyan }
+function Ok($t) { Write-Host "  OK   $t" -ForegroundColor Green }
+function Aviso($t) { Write-Host "  !!   $t" -ForegroundColor Yellow }
+function Falha($t) { Write-Host "  ERRO $t" -ForegroundColor Red; Read-Host "Enter para sair"; exit 1 }
+
+$eu = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $eu.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Start-Process powershell -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Destino `"$Destino`""
+    exit
+}
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$Origem = Split-Path -Parent $PSCommandPath
+
+# ---------------------------------------------------------------- 1. ficheiros
+Titulo "Ficheiros"
+New-Item -ItemType Directory -Force -Path $Destino, "$Destino\logs" | Out-Null
+if ((Resolve-Path $Origem).Path -ne (Resolve-Path $Destino).Path) {
+    Copy-Item -Recurse -Force "$Origem\primavera_sync" $Destino
+    foreach ($f in "config.example.ini", "instalar.bat", "instalar.ps1", "estado.bat", "desinstalar.bat", "cliente.ini") {
+        if (Test-Path "$Origem\$f") { Copy-Item -Force "$Origem\$f" $Destino }
+    }
+}
+Get-ChildItem "$Destino\primavera_sync" -Recurse -Filter "__pycache__" -Directory | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+# a pasta tem a chave e a palavra-passe: só administradores e o sistema
+$adm = (New-Object Security.Principal.SecurityIdentifier "S-1-5-32-544").Translate([Security.Principal.NTAccount]).Value
+icacls $Destino /inheritance:r /grant:r "${adm}:(OI)(CI)F" "SYSTEM:(OI)(CI)F" | Out-Null
+Ok "sync em $Destino (pasta só para administradores)"
+if (-not (Test-Path "$Destino\cliente.ini")) { Aviso "sem cliente.ini: o assistente pergunta o endereço e a chave da Lonntra" }
+
+# ---------------------------------------------------------------- 2. Python e pyodbc
+Titulo "Python"
+function Achar-Python {
+    foreach ($c in @("$env:ProgramFiles\Python312\python.exe", "$env:ProgramFiles\Python311\python.exe",
+                     "$env:ProgramFiles\Python310\python.exe")) { if (Test-Path $c) { return $c } }
+    $p = Get-Command python.exe -ErrorAction SilentlyContinue | Where-Object { $_.Source -notmatch "WindowsApps" } | Select-Object -First 1
+    if ($p) { return $p.Source }
+    return $null
+}
+$Py = Achar-Python
+if ($Py) {
+    $versao = & $Py -c "import sys; print('%d.%d' % sys.version_info[:2])"
+    if ([version]$versao -lt [version]"3.9") { $Py = $null; Aviso "Python $versao é antigo" }
+}
+if (-not $Py) {
+    Write-Host "  a descarregar e instalar o Python 3.12 (para todos os utilizadores)..."
+    $exe = "$env:TEMP\python-instalador.exe"
+    Invoke-WebRequest -Uri $PythonUrl -OutFile $exe -UseBasicParsing
+    Start-Process $exe -Wait -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0"
+    $Py = Achar-Python
+    if (-not $Py) { Falha "o Python não ficou instalado. Instale-o de python.org (para todos os utilizadores) e corra outra vez." }
+}
+Ok "Python: $Py"
+& $Py -m pip install --upgrade --quiet --disable-pip-version-check pyodbc
+if ($LASTEXITCODE -ne 0) { Falha "não consegui instalar o pyodbc (precisa de internet)." }
+Ok "pyodbc instalado"
+$drivers = (Get-OdbcDriver -Platform "64-bit" | Where-Object { $_.Name -match "SQL Server" }).Name
+if (-not $drivers) { Falha "não há nenhum driver ODBC do SQL Server. Instale o «ODBC Driver 18 for SQL Server» da Microsoft." }
+Ok ("drivers ODBC: " + ($drivers -join ", "))
+
+# ---------------------------------------------------------------- 3. assistente
+$antes = Get-ScheduledTask -TaskName $Tarefa -ErrorAction SilentlyContinue
+if ($antes) { Stop-ScheduledTask -TaskName $Tarefa -ErrorAction SilentlyContinue; Aviso "a tarefa que já existia foi parada para reconfigurar" }
+Push-Location $Destino
+& $Py -m primavera_sync.instalar
+$resultado = $LASTEXITCODE
+Pop-Location
+if ($resultado -ne 0) { Falha "a configuração não ficou completa (ver acima e $Destino\relatorio-instalacao.txt). Corrija e corra o instalar.bat outra vez." }
+
+# ---------------------------------------------------------------- 4. arranque automático
+Titulo "Arranque automático"
+$acao = New-ScheduledTaskAction -Execute $Py -Argument "-m primavera_sync.sincronizador config.ini" -WorkingDirectory $Destino
+$gatilho = New-ScheduledTaskTrigger -AtStartup
+$gatilho.Delay = "PT2M"   # dá tempo ao SQL Server de arrancar
+$definicoes = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -MultipleInstances IgnoreNew
+$quem = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+Register-ScheduledTask -TaskName $Tarefa -Action $acao -Trigger $gatilho -Settings $definicoes -Principal $quem `
+    -Description "primavera-sync: envia documentos, artigos e stock do Primavera para a Lonntra (só leitura)." -Force | Out-Null
+Start-ScheduledTask -TaskName $Tarefa
+Ok "tarefa «$Tarefa»: arranca com o Windows, como SYSTEM, e volta a arrancar se parar"
+
+# ---------------------------------------------------------------- 5. primeiro ciclo
+Titulo "Primeiro ciclo"
+$log = "$Destino\primavera-sync.log"
+$visto = $false
+for ($i = 0; $i -lt 36 -and -not $visto; $i++) {
+    Start-Sleep -Seconds 5
+    if (Test-Path $log) {
+        $fim = Get-Content $log -Tail 40 -Encoding UTF8
+        if ($fim -match "Ciclo terminado|Nada de novo|ERROR") { $visto = $true }
+    }
+}
+$estado = (Get-ScheduledTask -TaskName $Tarefa).State
+if (-not $visto) {
+    Aviso "ao fim de 3 minutos ainda não há um ciclo completo no log (a tarefa está: $estado). Pode estar a enviar muitos dados: ver $log"
+} elseif ($fim -match "ERROR") {
+    Aviso "o primeiro ciclo teve erros (a tarefa está: $estado). Últimas linhas:"
+    $fim | Select-Object -Last 12 | ForEach-Object { Write-Host "    $_" }
+} else {
+    Ok "a funcionar (tarefa: $estado). Últimas linhas do log:"
+    $fim | Select-Object -Last 6 | ForEach-Object { Write-Host "    $_" }
+}
+
+$rel = "$Destino\relatorio-instalacao.txt"
+Add-Content -Path $rel -Encoding UTF8 -Value "`n== Arranque automático`n  tarefa $Tarefa ($estado), Python $Py`n  log: $log"
+Write-Host ""
+Write-Host "Instalação terminada. Relatório: $rel" -ForegroundColor Cyan
+Write-Host "Na Lonntra: php yii integracao/estado mostra o último contacto deste servidor."
+Write-Host "Para ver o estado mais tarde: estado.bat (nesta pasta)."
+Read-Host "Enter para fechar"

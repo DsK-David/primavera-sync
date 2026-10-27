@@ -4,3 +4,7 @@ __pycache__/
 .venv/
 config.ini
 *.log
+cliente.ini
+clientes/
+relatorio-instalacao.txt
+logs/

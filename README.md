@@ -22,6 +22,10 @@ O que já foi enviado fica em `estado.db` (SQLite). A Lonntra também recusa o m
 
 ### Instalar
 
+**Instalação rápida:** pôr o `cliente.ini` do cliente (modelo em `cliente.example.ini`) junto do `instalar.bat` no servidor e fazer duplo clique. O instalador instala o Python, descobre o Primavera, cria o acesso só de leitura, propõe os mapas, verifica tudo, cria o arranque automático e mostra o resultado. Ver `docs/instalar-auto-style.md`.
+
+À mão:
+
 1. **Na Lonntra** (uma vez):
    - criar a empresa: `php scripts/criar_empresa_lonntra.php ../ilhapay "Auto Style" <NIF>` (ou pelo ecrã de Empresas);
    - gerar a chave: `php yii integracao/chave <NIF>`. A chave só se mostra nesse momento; gerar outra desliga a anterior.
