@@ -41,6 +41,19 @@ class Lonntra:
     def estado(self):
         return self._pedido("GET", "/integracao/primavera/estado")
 
+    def sinal(self, estado):
+        """Sinal de vida de cada ciclo: a Lonntra avisa a empresa se deixar de o receber ou se houver erros."""
+        return self._pedido("POST", "/integracao/primavera/estado", estado)
+
     def documento(self, dados):
         """Devolve {'id', 'referencia', 'ja_existia', 'avisos'}."""
         return self._pedido("POST", "/integracao/primavera/documento", dados)
+
+    def artigos(self, artigos):
+        """Cria ou atualiza artigos. Devolve {'criados', 'atualizados', 'erros': [{'codigo', 'erro'}]}."""
+        return self._pedido("POST", "/integracao/primavera/artigos", {"artigos": artigos})
+
+    def stock(self, armazens=(), movimentos=(), existencias=()):
+        """Devolve {'armazens', 'movimentos', 'existencias', 'erros': [{'codigo', 'erro'}]}."""
+        return self._pedido("POST", "/integracao/primavera/stock",
+                            {"armazens": list(armazens), "movimentos": list(movimentos), "existencias": list(existencias)})

@@ -16,7 +16,7 @@ Na Lonntra os documentos ficam:
 - imutáveis, como os documentos comunicados;
 - com o cliente e os artigos criados pelo código do Primavera. As FR e VD vão pagas, e as NC ficam ligadas à fatura de origem.
 
-O que vai: os documentos não anulados (`CabecDoc` + `LinhasDoc`) dos tipos listados em `[tipos_documento]`. Na primeira corrida vai o histórico todo; depois, de `intervalo` em `intervalo` segundos, vão os novos.
+O que vai: os documentos não anulados (`CabecDoc` + `LinhasDoc`) dos tipos listados em `[tipos_documento]`, e também o **catálogo de artigos** e o **stock** (armazéns, quantidades e movimentos de entrada e saída), só para consulta na Lonntra (`catalogo = sim`). Do catálogo e do stock só vai o que mudou desde o último envio. Na primeira corrida vai o histórico todo; depois, de `intervalo` em `intervalo` segundos, vão os novos.
 
 O que já foi enviado fica em `estado.db` (SQLite). A Lonntra também recusa o mesmo documento duas vezes, por isso pode parar, arrancar ou perder o `estado.db` sem duplicar nada. Um documento recusado (por exemplo, uma taxa de IVA que não existe na Lonntra) fica registado com o motivo e não trava os outros. Se a Lonntra estiver em baixo, tenta de novo no ciclo seguinte.
 

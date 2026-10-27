@@ -11,13 +11,18 @@ Uso:
 """
 import argparse
 import configparser
+import hashlib
+import json
 import logging
+import logging.handlers
+import socket
 import re
 import sqlite3
 import sys
 import time
 from datetime import date, datetime, timedelta
 
+from . import __version__
 from .lonntra import ErroApi, ErroLigacao, Lonntra
 
 log = logging.getLogger("primavera_sync")
@@ -28,6 +33,12 @@ CREATE TABLE IF NOT EXISTS enviados (
     numero TEXT NOT NULL,          -- ex.: FA 2026/15
     lonntra_id TEXT,
     enviado_em TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS catalogo (
+    tipo TEXT NOT NULL,            -- artigo | armazem | existencia | movimento
+    chave TEXT NOT NULL,           -- código do artigo / armazém, «artigo|armazém», Id do movimento
+    valor TEXT NOT NULL,           -- o que foi enviado (impressão do artigo, nome, quantidade)
+    PRIMARY KEY (tipo, chave)
 );
 CREATE TABLE IF NOT EXISTS erros (
     documento TEXT PRIMARY KEY,
@@ -72,6 +83,14 @@ class Estado:
     def tentativas(self):
         return dict(self.conn.execute("SELECT documento, tentativas FROM erros"))
 
+    def catalogo(self, tipo):
+        return dict(self.conn.execute("SELECT chave, valor FROM catalogo WHERE tipo=?", (tipo,)))
+
+    def guardar_catalogo(self, tipo, valores):
+        with self.conn:
+            self.conn.executemany("INSERT OR REPLACE INTO catalogo VALUES (?,?,?)", [(tipo, k, v) for k, v in valores.items()])
+            self.conn.executemany("DELETE FROM erros WHERE documento=?", [(f"{tipo}:{k}",) for k in valores])
+
     def vazio(self):
         return self.conn.execute("SELECT 1 FROM enviados LIMIT 1").fetchone() is None
 
@@ -80,6 +99,15 @@ class Estado:
         erros = self.conn.execute("SELECT numero, mensagem, tentativas, ultima FROM erros ORDER BY ultima DESC").fetchall()
         return n, erros
 
+    def ultimo_erro(self):
+        """(número de registos com erro, o texto do mais recente)"""
+        n = self.conn.execute("SELECT COUNT(*) FROM erros").fetchone()[0]
+        r = self.conn.execute("SELECT numero, mensagem FROM erros ORDER BY ultima DESC LIMIT 1").fetchone()
+        return n, (f"{r[0]}: {r[1]}" if r else None)
+
+    def resumo_catalogo(self):
+        return dict(self.conn.execute("SELECT tipo, COUNT(*) FROM catalogo GROUP BY tipo"))
+
 
 def _num(v):
     return float(v or 0)
@@ -87,6 +115,15 @@ def _num(v):
 
 def _txt(v):
     return str(v).strip() if v is not None else ""
+
+
+def _impressao(dados):
+    return hashlib.sha1(json.dumps(dados, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _partes(lista, tamanho=500):
+    for i in range(0, len(lista), tamanho):
+        yield lista[i:i + tamanho]
 
 
 def _data(v):
@@ -100,7 +137,8 @@ def _data(v):
 
 
 class Sincronizador:
-    """Um ciclo: lê no Primavera os documentos ainda não enviados e envia-os, um a um, pela ordem da data."""
+    """Um ciclo: artigos e stock do Primavera (só o que mudou), depois os documentos ainda não enviados, pela ordem
+    da data. Um erro no catálogo ou no stock fica no log e não impede os documentos."""
 
     def __init__(self, fonte, lonntra, estado, cfg):
         self.fonte, self.lonntra, self.estado, self.cfg = fonte, lonntra, estado, cfg
@@ -108,8 +146,123 @@ class Sincronizador:
         self.tipos = {k.upper(): v.strip().upper() for k, v in cfg["tipos_documento"].items()}  # FA = FT
         self.modos = {k.upper(): v.strip() for k, v in cfg["modos_pagamento"].items()} if cfg.has_section("modos_pagamento") else {}
         self.max_tentativas = self.s.getint("max_tentativas", 5)
+        self.erro_catalogo = None
 
     def ciclo(self, completo=False):
+        if _txt(self.s.get("catalogo", "sim")).lower() not in ("nao", "não", "no", "false", "0", "off"):
+            try:
+                self.catalogo(completo)
+                self.erro_catalogo = None
+            except ErroLigacao:
+                raise
+            except Exception as e:  # noqa: BLE001 - ex.: uma consulta de stock que não existe nesta versão do Primavera
+                self.erro_catalogo = f"catálogo/stock: {e}"[:300]
+                log.exception("Catálogo ou stock: erro; os documentos continuam. Ver [consultas] no config.ini.")
+        return self.documentos(completo)
+
+    # ---- catálogo e stock (ADR-061, fase 3)
+
+    def catalogo(self, completo=False):
+        """Envia os artigos, armazéns, movimentos e existências que mudaram desde o último envio."""
+        r = {"artigos": self._artigos()}
+        r.update(self._stock(completo))
+        if any(r.values()):
+            log.info("Catálogo e stock: %s.", ", ".join(f"{v} {k}" for k, v in r.items() if v))
+        return r
+
+    def _artigos(self):
+        servicos = {t.strip() for t in self.s.get("tipos_artigo_servico", "").split(",") if t.strip()}
+        feitos = self.estado.catalogo("artigo")
+        novos = {}
+        for a in self.fonte.catalogo(self.s.get("moeda", "CVE")):
+            codigo = _txt(a["Artigo"])
+            if not codigo:
+                continue
+            taxa = a.get("Taxa")
+            preco = _num(a.get("PVP"))
+            if a.get("PVPComIva") and taxa is not None:
+                preco = preco / (1 + _num(taxa) / 100)
+            item = {
+                "codigo": codigo,
+                "descricao": _txt(a.get("Descricao")) or codigo,
+                "servico": _txt(a.get("TipoArtigo")) in servicos,
+                "taxa_iva": _num(taxa) if taxa is not None else None,
+                "preco": round(preco, 4),
+                "custo": round(_num(a.get("Custo")), 4),
+                "codigo_barras": _txt(a.get("CodBarras")) or None,
+                "familia": {"codigo": _txt(a["Familia"]), "nome": _txt(a.get("FamiliaNome")) or _txt(a["Familia"])}
+                if _txt(a.get("Familia")) else None,
+                "ativo": not a.get("Anulado"),
+            }
+            impressao = _impressao(item)
+            if feitos.get(codigo) != impressao:
+                novos[codigo] = (item, impressao)
+        enviados = 0
+        for parte in _partes(list(novos.values())):
+            r = self.lonntra.artigos([i for i, _ in parte])
+            erros = self._erros("artigo", r)
+            self.estado.guardar_catalogo("artigo", {i["codigo"]: h for i, h in parte if i["codigo"] not in erros})
+            enviados += len(parte) - len(erros)
+        return enviados
+
+    def _stock(self, completo):
+        r = {"armazens": 0, "movimentos": 0, "existencias": 0}
+
+        feitos = self.estado.catalogo("armazem")
+        armazens = {_txt(a["Armazem"]): _txt(a.get("Descricao")) for a in self.fonte.armazens() if _txt(a.get("Armazem"))}
+        novos = {k: v for k, v in armazens.items() if feitos.get(k) != v}
+        if novos:
+            self.lonntra.stock(armazens=[{"codigo": k, "nome": v} for k, v in novos.items()])
+            self.estado.guardar_catalogo("armazem", novos)
+            r["armazens"] = len(novos)
+
+        feitos = self.estado.catalogo("movimento")
+        desde = date(1900, 1, 1) if completo or not feitos else date.today() - timedelta(days=self.s.getint("revisao_dias", 30))
+        movimentos = []
+        for m in self.fonte.movimentos(desde):
+            if m["Id"] in feitos or _num(m.get("Quantidade")) == 0:
+                continue
+            tipo = _txt(m.get("EntradaSaida")).upper()[:1]
+            if tipo not in ("E", "S"):
+                tipo = "E" if _num(m.get("Quantidade")) > 0 else "S"
+            movimentos.append({"id": m["Id"], "artigo": _txt(m["Artigo"]), "armazem": _txt(m.get("Armazem")),
+                               "data": _data(m["Data"]), "tipo": tipo, "quantidade": abs(_num(m["Quantidade"])),
+                               "documento": _txt(m.get("Documento")) or None})
+        for parte in _partes(movimentos):
+            erros = self._erros("movimento", self.lonntra.stock(movimentos=parte))
+            self.estado.guardar_catalogo("movimento", {m["id"]: "" for m in parte if m["id"] not in erros})
+            r["movimentos"] += len(parte) - len(erros)
+
+        feitos = self.estado.catalogo("existencia")
+        existencias = {}
+        for e in self.fonte.existencias():
+            chave = f"{_txt(e['Artigo'])}|{_txt(e.get('Armazem'))}"
+            valor = f"{_num(e.get('Quantidade')):.4f}"
+            if feitos.get(chave) != valor:
+                existencias[chave] = valor
+        lista = [{"artigo": k.split("|")[0], "armazem": k.split("|")[1], "quantidade": float(v)} for k, v in existencias.items()]
+        for parte in _partes(lista):
+            erros = self._erros("existencia", self.lonntra.stock(existencias=parte))
+            ok = {f"{e['artigo']}|{e['armazem']}": existencias[f"{e['artigo']}|{e['armazem']}"] for e in parte
+                  if f"{e['artigo']}@{e['armazem']}" not in erros}
+            self.estado.guardar_catalogo("existencia", ok)
+            r["existencias"] += len(ok)
+        return r
+
+    def _erros(self, tipo, resposta):
+        """Regista os itens recusados pela Lonntra e devolve os códigos deles."""
+        codigos = set()
+        for e in resposta.get("erros") or []:
+            codigo = _txt(e.get("codigo"))
+            codigos.add(codigo)
+            self.estado.erro(f"{tipo}:{codigo}", f"{tipo} {codigo}", e.get("erro"))
+        if codigos:
+            log.warning("%d %s(s) recusado(s) pela Lonntra (ver --estado).", len(codigos), tipo)
+        return codigos
+
+    # ---- documentos
+
+    def documentos(self, completo=False):
         desde = None
         if not completo and not self.estado.vazio():
             desde = date.today() - timedelta(days=self.s.getint("revisao_dias", 30))
@@ -202,25 +355,93 @@ def ler_config(caminho):
     return cfg
 
 
+def estado_do_sync(estado, erro_ciclo=None, erro_catalogo=None):
+    """O que vai no sinal de vida para a Lonntra."""
+    n, ultimo = estado.ultimo_erro()
+    c = estado.resumo_catalogo()
+    extra = [e for e in (erro_ciclo, erro_catalogo) if e]
+    return {
+        "versao": __version__, "maquina": socket.gethostname(),
+        "documentos": estado.resumo()[0], "artigos": c.get("artigo", 0), "movimentos": c.get("movimento", 0),
+        "erros": n + len(extra), "ultimo_erro": (extra[0] if extra else ultimo),
+        "ciclo": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def verificar(cfg):
+    """Testa a ligação ao SQL Server, cada consulta e a chave da Lonntra, sem enviar nada. Devolve True se está tudo bem."""
+    ok = True
+
+    def passo(nome, fn):
+        nonlocal ok
+        try:
+            print(f"  OK   {nome}: {fn()}")
+        except Exception as e:  # noqa: BLE001
+            ok = False
+            print(f"  ERRO {nome}: {e}")
+
+    print("Lonntra")
+    lonntra = Lonntra(cfg["lonntra"]["url"], cfg["lonntra"]["chave"])
+    passo("chave e endereço", lambda: f"empresa {lonntra.estado().get('empresa')}")
+    print("Primavera (SQL Server)")
+    from .evolution import Evolution
+    try:
+        fonte = Evolution.ligar(cfg["primavera"]["ligacao"], dict(cfg["consultas"]) if cfg.has_section("consultas") else {})
+        print("  OK   ligação")
+    except Exception as e:  # noqa: BLE001
+        print(f"  ERRO ligação: {e}")
+        return False
+    s = cfg["sincronizacao"]
+    tipos = [k.upper() for k in cfg["tipos_documento"]]
+    semana = date.today() - timedelta(days=7)
+    passo(f"documentos {', '.join(tipos)} (últimos 7 dias)", lambda: f"{len(fonte.documentos(tipos, semana))} documentos")
+    passo("linhas e clientes", lambda: _amostra(fonte, tipos))
+    passo("artigos", lambda: f"{len(fonte.catalogo(s.get('moeda', 'CVE')))} artigos")
+    passo("armazéns", lambda: ", ".join(_txt(a['Armazem']) for a in fonte.armazens()) or "nenhum")
+    passo("existências", lambda: f"{len(fonte.existencias())} linhas")
+    passo("movimentos de stock (últimos 7 dias)", lambda: f"{len(fonte.movimentos(semana))} movimentos")
+    print("Tudo certo." if ok else "Há erros: corrija o config.ini ([primavera], [lonntra] ou [consultas]) e volte a verificar.")
+    return ok
+
+
+def _amostra(fonte, tipos):
+    docs = fonte.documentos(tipos, date.today() - timedelta(days=90))[-5:]
+    if not docs:
+        return "sem documentos nos últimos 90 dias para testar"
+    linhas = fonte.linhas([d["Id"] for d in docs])
+    clientes = fonte.clientes({d["Entidade"] for d in docs if d["Entidade"]})
+    return f"{sum(len(v) for v in linhas.values())} linhas e {len(clientes)} clientes em {len(docs)} documentos"
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="python -m primavera_sync.sincronizador",
-                                description="Envia os documentos do Primavera para a Lonntra.")
+                                description=f"primavera-sync {__version__}: envia os dados do Primavera para a Lonntra.")
     p.add_argument("config")
+    p.add_argument("--verificar", action="store_true", help="testa a ligação, as consultas e a chave, sem enviar nada")
     p.add_argument("--uma-vez", action="store_true", help="corre um ciclo e sai")
-    p.add_argument("--completo", action="store_true", help="revê todos os documentos, não só os recentes")
-    p.add_argument("--estado", action="store_true", help="mostra quantos foram enviados e os erros")
+    p.add_argument("--completo", action="store_true", help="revê todos os documentos e movimentos, não só os recentes")
+    p.add_argument("--estado", action="store_true", help="mostra o que foi enviado e os erros")
     p.add_argument("--repetir-erros", action="store_true", help="volta a tentar os documentos que esgotaram as tentativas")
     a = p.parse_args(argv)
     cfg = ler_config(a.config)
     s = cfg["sincronizacao"]
+
+    if a.verificar:
+        sys.exit(0 if verificar(cfg) else 1)
+
+    # log com rotação: 5 ficheiros de 5 MB, para não encher o disco do servidor
+    ficheiro = logging.handlers.RotatingFileHandler(s.get("log", "primavera-sync.log"), maxBytes=5_000_000,
+                                                    backupCount=5, encoding="utf-8")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
-                        handlers=[logging.StreamHandler(),
-                                  logging.FileHandler(s.get("log", "primavera-sync.log"), encoding="utf-8")])
+                        handlers=[logging.StreamHandler(), ficheiro])
     estado = Estado(s.get("estado", "estado.db"))
 
     if a.estado:
         n, erros = estado.resumo()
         print(f"Documentos enviados: {n}")
+        c = estado.resumo_catalogo()
+        print(f"Artigos: {c.get('artigo', 0)}, armazéns: {c.get('armazem', 0)}, "
+              f"existências: {c.get('existencia', 0)}, movimentos de stock: {c.get('movimento', 0)}")
         for numero, msg, vezes, ultima in erros:
             print(f"  ERRO {numero} ({vezes}x, {ultima}): {msg}")
         return
@@ -228,24 +449,31 @@ def main(argv=None):
         with estado.conn:
             estado.conn.execute("DELETE FROM erros")
 
+    log.info("primavera-sync %s a arrancar.", __version__)
     lonntra = Lonntra(cfg["lonntra"]["url"], cfg["lonntra"]["chave"])
-    try:
-        lonntra.estado()
-    except ErroLigacao as e:
-        sys.exit(f"A Lonntra recusou a ligação ou a chave: {e}")
-
     from .evolution import Evolution
-    sinc = Sincronizador(Evolution.ligar(cfg["primavera"]["ligacao"]), lonntra, estado, cfg)
+    consultas = dict(cfg["consultas"]) if cfg.has_section("consultas") else {}
     intervalo = s.getint("intervalo", 60)
     completo = a.completo
+    sinc = None
     while True:
+        erro_ciclo = None
         try:
+            if sinc is None:  # a primeira vez, e depois de a ligação ao SQL Server cair
+                sinc = Sincronizador(Evolution.ligar(cfg["primavera"]["ligacao"], consultas), lonntra, estado, cfg)
             sinc.ciclo(completo=completo)
             completo = False
         except ErroLigacao as e:
+            erro_ciclo = f"Lonntra: {e}"
             log.error("A Lonntra não respondeu: %s. Tento outra vez daqui a %ds.", e, intervalo)
-        except Exception:  # noqa: BLE001 - o serviço não pode morrer por um erro de um ciclo
-            log.exception("Erro no ciclo; tento outra vez daqui a %ds.", intervalo)
+        except Exception as e:  # noqa: BLE001 - o serviço não pode morrer por um erro de um ciclo
+            erro_ciclo = f"{type(e).__name__}: {e}"[:300]
+            log.exception("Erro no ciclo; volto a ligar ao SQL Server e tento outra vez daqui a %ds.", intervalo)
+            sinc = None
+        try:
+            lonntra.sinal(estado_do_sync(estado, erro_ciclo, sinc.erro_catalogo if sinc else None))
+        except ErroLigacao as e:
+            log.warning("Sem sinal para a Lonntra: %s", e)
         if a.uma_vez:
             return
         time.sleep(intervalo)

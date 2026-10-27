@@ -5,7 +5,7 @@ from datetime import date
 from pathlib import Path
 
 from primavera_sync.lonntra import ErroApi, ErroLigacao
-from primavera_sync.sincronizador import COLETIVO, Estado, Sincronizador
+from primavera_sync.sincronizador import COLETIVO, Estado, Sincronizador, estado_do_sync
 
 CONFIG = Path(__file__).resolve().parent.parent / "config.example.ini"
 
@@ -15,6 +15,21 @@ class FontePrimavera:
 
     def __init__(self):
         self.docs, self.linhas_, self.clientes_, self.artigos_ = [], {}, {}, {}
+        self.catalogo_, self.armazens_, self.existencias_, self.movimentos_ = [], [], [], []
+        self.desde_movimentos = None
+
+    def catalogo(self, moeda):
+        return self.catalogo_
+
+    def armazens(self):
+        return self.armazens_
+
+    def existencias(self):
+        return self.existencias_
+
+    def movimentos(self, desde):
+        self.desde_movimentos = desde
+        return [m for m in self.movimentos_ if m["Data"] >= desde]
 
     def documentos(self, tipos, desde=None):
         return [d for d in self.docs if d["TipoDoc"] in tipos and (desde is None or d["Data"] >= desde)]
@@ -33,6 +48,17 @@ class LonntraFalsa:
     def __init__(self):
         self.pedidos, self.ids = [], set()
         self.em_baixo = False
+        self.pedidos_artigos, self.pedidos_stock = [], []
+
+    def artigos(self, artigos):
+        self.pedidos_artigos.append(artigos)
+        erros = [{"codigo": a["codigo"], "erro": "não há taxa de IVA"} for a in artigos if a["taxa_iva"] is None]
+        return {"criados": len(artigos) - len(erros), "atualizados": 0, "erros": erros}
+
+    def stock(self, armazens=(), movimentos=(), existencias=()):
+        self.pedidos_stock.append({"armazens": list(armazens), "movimentos": list(movimentos), "existencias": list(existencias)})
+        erros = [{"codigo": f"{e['artigo']}@{e['armazem']}", "erro": "serviço"} for e in existencias if e["artigo"] == "MO"]
+        return {"armazens": len(armazens), "movimentos": len(movimentos), "existencias": len(existencias) - len(erros), "erros": erros}
 
     def documento(self, corpo):
         if self.em_baixo:
@@ -62,6 +88,7 @@ class SincronizadorTest(unittest.TestCase):
         self.cfg = configparser.ConfigParser(interpolation=None)
         self.cfg.read(CONFIG, encoding="utf-8")
         self.cfg["sincronizacao"]["tipos_artigo_servico"] = "0"
+        self.cfg["sincronizacao"]["catalogo"] = "nao"  # estes testes são dos documentos; o catálogo tem os seus
         self.fonte, self.api = FontePrimavera(), LonntraFalsa()
         self.estado = Estado(str(Path(self.tmp.name) / "estado.db"))
         self.s = Sincronizador(self.fonte, self.api, self.estado, self.cfg)
@@ -149,6 +176,88 @@ class SincronizadorTest(unittest.TestCase):
             self.assertTrue(COLETIVO.search(nome), nome)
         for nome in ("Maria Lima", "João Salazar", "Sandra Assis"):
             self.assertFalse(COLETIVO.search(nome), nome)
+
+
+class CatalogoTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        cfg = configparser.ConfigParser(interpolation=None)
+        cfg.read(CONFIG, encoding="utf-8")
+        cfg["sincronizacao"]["tipos_artigo_servico"] = "0"
+        self.fonte, self.api = FontePrimavera(), LonntraFalsa()
+        self.estado = Estado(str(Path(self.tmp.name) / "estado.db"))
+        self.s = Sincronizador(self.fonte, self.api, self.estado, cfg)
+        self.fonte.catalogo_ = [
+            {"Artigo": "PN195", "Descricao": "Pneu 195/65", "TipoArtigo": "3", "Taxa": 15, "CodBarras": "560123",
+             "Familia": "PNEUS", "FamiliaNome": "Pneus", "Anulado": False, "Custo": 5200, "PVP": 9200, "PVPComIva": True},
+            {"Artigo": "MO", "Descricao": "Mão de obra", "TipoArtigo": "0", "Taxa": 15, "CodBarras": None,
+             "Familia": None, "FamiliaNome": None, "Anulado": False, "Custo": 0, "PVP": 2500, "PVPComIva": False},
+        ]
+        self.fonte.armazens_ = [{"Armazem": "A1", "Descricao": "Oficina"}]
+        self.fonte.existencias_ = [{"Artigo": "PN195", "Armazem": "A1", "Quantidade": 8}]
+        self.fonte.movimentos_ = [
+            {"Id": "M1", "Artigo": "PN195", "Armazem": "A1", "Data": date(2020, 3, 1), "EntradaSaida": "E", "Quantidade": 10, "Documento": "VGR 1"},
+            {"Id": "M2", "Artigo": "PN195", "Armazem": "A1", "Data": date(2020, 3, 15), "EntradaSaida": None, "Quantidade": -2, "Documento": "FA 7"},
+        ]
+
+    def tearDown(self):
+        self.estado.conn.close()
+        self.tmp.cleanup()
+
+    def test_envia_o_catalogo_e_o_stock_e_depois_so_o_que_mudou(self):
+        self.assertEqual(self.s.catalogo(), {"artigos": 2, "armazens": 1, "movimentos": 2, "existencias": 1})
+        pneu = self.api.pedidos_artigos[0][0]
+        self.assertEqual(pneu, {"codigo": "PN195", "descricao": "Pneu 195/65", "servico": False, "taxa_iva": 15,
+                                "preco": 8000, "custo": 5200, "codigo_barras": "560123",
+                                "familia": {"codigo": "PNEUS", "nome": "Pneus"}, "ativo": True})
+        self.assertTrue(self.api.pedidos_artigos[0][1]["servico"])
+        movimentos = [m for p in self.api.pedidos_stock for m in p["movimentos"]]
+        self.assertEqual([(m["id"], m["tipo"], m["quantidade"], m["data"]) for m in movimentos],
+                         [("M1", "E", 10, "2020-03-01"), ("M2", "S", 2, "2020-03-15")])
+        self.assertEqual(self.fonte.desde_movimentos, date(1900, 1, 1), "a primeira vez lê os movimentos todos")
+
+        # segundo ciclo sem mudanças: nada é enviado; depois só o que mudou
+        self.assertEqual(self.s.catalogo(), {"artigos": 0, "armazens": 0, "movimentos": 0, "existencias": 0})
+        self.fonte.catalogo_[0] = {**self.fonte.catalogo_[0], "PVP": 9775, "Anulado": True}
+        self.fonte.existencias_ = [{"Artigo": "PN195", "Armazem": "A1", "Quantidade": 5}]
+        self.assertEqual(self.s.catalogo(), {"artigos": 1, "armazens": 0, "movimentos": 0, "existencias": 1})
+        self.assertEqual(self.api.pedidos_artigos[-1][0]["preco"], 8500)
+        self.assertFalse(self.api.pedidos_artigos[-1][0]["ativo"])
+        self.assertNotEqual(self.fonte.desde_movimentos, date(1900, 1, 1), "depois só os movimentos recentes")
+
+    def test_recusas_ficam_registadas_e_repetem(self):
+        self.fonte.catalogo_[1] = {**self.fonte.catalogo_[1], "Taxa": None}
+        self.fonte.existencias_.append({"Artigo": "MO", "Armazem": "A1", "Quantidade": 1})
+        r = self.s.catalogo()
+        self.assertEqual((r["artigos"], r["existencias"]), (1, 1))
+        _, erros = self.estado.resumo()
+        self.assertEqual({e[0] for e in erros}, {"artigo MO", "existencia MO@A1"})
+        self.assertEqual(self.s.catalogo()["artigos"], 0)
+        self.assertEqual(len(self.api.pedidos_artigos[-1]), 1, "o artigo recusado volta a ser enviado")
+
+    def test_erro_no_stock_nao_impede_os_documentos(self):
+        def falha(desde):
+            raise RuntimeError("Invalid object name 'INV_Movimentos'")
+        self.fonte.movimentos = falha
+        self.fonte.docs = [doc("A", "FA", 1, 9200)]
+        self.fonte.linhas_ = {"A": [linha("A", "PN195", 1, 8000)]}
+        self.fonte.clientes_ = {"C001": {"Cliente": "C001", "Nome": "Cliente"}}
+        with self.assertLogs("primavera_sync", level="ERROR"):
+            self.assertEqual(self.s.ciclo()["documentos"], 1)
+
+
+class SinalTest(unittest.TestCase):
+    def test_sinal_de_vida_leva_o_resumo_e_o_ultimo_erro(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            e = Estado(str(Path(tmp) / "e.db"))
+            e.marcar("A", "FA 2026/1", "x")
+            e.erro("B", "FA 2026/2", "Não há taxa de IVA de 4%")
+            r = estado_do_sync(e)
+            self.assertEqual((r["documentos"], r["erros"], r["ultimo_erro"]), (1, 1, "FA 2026/2: Não há taxa de IVA de 4%"))
+            r = estado_do_sync(e, erro_ciclo="OperationalError: SQL Server não responde")
+            self.assertEqual((r["erros"], r["ultimo_erro"]), (2, "OperationalError: SQL Server não responde"))
+            self.assertTrue(r["versao"] and r["maquina"])
+            e.conn.close()
 
 
 if __name__ == "__main__":
