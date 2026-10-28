@@ -399,3 +399,15 @@ mkdir logs
 - **Recibos**: as faturas a crédito ficam «por pagar» na Lonntra até haver a rota de recibos (fase 2 do ADR-061).
 - **Lotes e localizações** dentro do armazém: somam-se por armazém. **Unidades de medida**: todos os artigos ficam em «Unidade».
 - O tipo de cliente (coletivo/singular) sai do nome («Lda», «S.A.»…). Confirmar com a Auto Style.
+
+## O sync adapta-se à estrutura da base
+
+O sync não depende de nomes fixos de tabelas e colunas: ao arrancar, lê a estrutura da base do Primavera e monta as consultas (`primavera_sync/esquema.py`). Para cada dado há uma lista de nomes possíveis, procurados sem ligar a maiúsculas, acentos ou «_», e com tolerância a pequenas diferenças de escrita.
+
+- Dado **opcional** em falta (vencimento, morada, custo, preço…): vai vazio e fica registado; o sync continua.
+- Dado **indispensável** em falta (número, data, total do documento; artigo, quantidade, preço líquido e IVA da linha): o sync não envia documentos errados; para e diz qual coluna falta (aparece no log, no `--verificar` e no aviso da Lonntra).
+- Se a Primavera for atualizada e uma consulta falhar por tabela ou coluna inexistente, o sync **lê a estrutura de novo e repete** a consulta, sem ninguém mexer no código.
+- Stock: usa a consulta de origem se ela funcionar; senão procura as tabelas de armazéns, existências e movimentos pelas colunas (`descobrir.py`).
+- Uma consulta escrita à mão em `[consultas]` do `config.ini` tem sempre prioridade.
+
+Para ver o que o sync percebeu: `python -m primavera_sync.sincronizador config.ini --esquema` mostra a consulta de cada parte, ou o que falta e porquê. O `--verificar` lista também o que ficou vazio ou foi assumido.

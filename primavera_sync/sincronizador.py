@@ -483,6 +483,8 @@ def verificar(cfg):
             print("  --   movimentos de stock desligados no config.ini: não testados")
         else:
             passo("movimentos de stock (últimos 7 dias)", lambda: f"{len(fonte.movimentos(semana))} movimentos")
+    for nota in getattr(fonte, "notas", []):  # o que o sync assumiu ou ficou vazio por a base ser diferente
+        print(f"  !!   estrutura: {nota}")
     print("Tudo certo." if ok else "Há erros: corrija o config.ini ([primavera], [lonntra] ou [consultas]) e volte a verificar.")
     return ok
 
@@ -528,6 +530,8 @@ def main(argv=None):
     p.add_argument("--verificar", action="store_true", help="testa a ligação, as consultas e a chave, sem enviar nada")
     p.add_argument("--uma-vez", action="store_true", help="corre um ciclo e sai")
     p.add_argument("--completo", action="store_true", help="revê todos os documentos e movimentos, não só os recentes")
+    p.add_argument("--esquema", action="store_true",
+                   help="mostra o que o sync percebeu da base do Primavera: tabelas e colunas usadas, e o que falta")
     p.add_argument("--teste", nargs="?", const=10, type=int, metavar="N",
                    help="envia só N (10) documentos, artigos, armazéns, movimentos e existências para confirmar que chegam")
     p.add_argument("--estado", action="store_true", help="mostra o que foi enviado e os erros")
@@ -563,6 +567,9 @@ def main(argv=None):
     lonntra = Lonntra(cfg["lonntra"]["url"], cfg["lonntra"]["chave"])
     from .evolution import Evolution
     consultas = dict(cfg["consultas"]) if cfg.has_section("consultas") else {}
+    if a.esquema:
+        print(Evolution.ligar(cfg["primavera"]["ligacao"], consultas).relatorio())
+        return
     if a.teste:
         sys.exit(0 if imprimir_teste(Sincronizador(Evolution.ligar(cfg["primavera"]["ligacao"], consultas), lonntra, estado, cfg)
                                      .amostra(a.teste), a.teste) else 1)

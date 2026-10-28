@@ -1,4 +1,15 @@
-"""Leitura (só SELECT) da base de dados de uma empresa do Primavera ERP Evolution (v10) no SQL Server."""
+"""Leitura (só SELECT) da base de dados de uma empresa do Primavera ERP no SQL Server.
+
+As consultas são montadas a partir da estrutura real da base (esquema.py), por isso uma coluna ou tabela com outro
+nome não pára o sync. As consultas abaixo são a reserva, se a estrutura da base não puder ser lida; uma consulta
+escrita à mão em [consultas] do config.ini tem sempre prioridade.
+"""
+import logging
+
+from . import descobrir, esquema
+from .esquema import Consulta, Esquema, ErroEsquema
+
+log = logging.getLogger("primavera_sync")
 
 # Só documentos de cliente; as linhas sem artigo (comentários) não entram.
 DOCUMENTOS_SQL = """
@@ -58,10 +69,31 @@ FROM INV_Movimentos m WHERE m.Data >= ?
 }
 
 
+
+
 def _lotes(valores, tamanho=500):
     valores = list(valores)
     for i in range(0, len(valores), tamanho):
         yield valores[i:i + tamanho]
+
+
+RESERVA = {
+    "documentos": Consulta(DOCUMENTOS_SQL, {"filtro_data": "AND c.Data >= ?"}),
+    "linhas": Consulta(LINHAS_SQL),
+    "clientes": Consulta(CLIENTES_SQL),
+    "artigos_codigos": Consulta(ARTIGOS_SQL),
+    **{k: Consulta(v) for k, v in CATALOGO_SQL.items()},
+}
+STOCK = ("armazens", "existencias", "movimentos")
+ORDEM = ("documentos", "linhas", "clientes", "artigos_codigos", "artigos", *STOCK)
+
+
+def estrutura_mudou(erro):
+    """O SQL Server diz que uma tabela ou coluna não existe (42S02/42S22), em qualquer idioma."""
+    estado = str(erro.args[0]) if getattr(erro, "args", None) else ""
+    texto = str(erro).lower()
+    return estado in ("42S02", "42S22") or any(x in texto for x in (
+        "invalid object name", "invalid column name", "nome de objeto inválido", "nome de coluna inválido"))
 
 
 class Evolution:
@@ -69,7 +101,11 @@ class Evolution:
 
     def __init__(self, ligacao, consultas=None):
         self.conn = ligacao
-        self.consultas = {**CATALOGO_SQL, **{k: v for k, v in (consultas or {}).items() if v.strip()}}
+        self.manuais = {k: v for k, v in (consultas or {}).items() if v.strip()}
+        self.esquema = None
+        self._cache = {}
+        self.notas = []
+        self._carregar()
 
     @classmethod
     def ligar(cls, connection_string, consultas=None):
@@ -80,17 +116,102 @@ class Evolution:
         conn.execute("SET DEADLOCK_PRIORITY LOW; SET LOCK_TIMEOUT 5000;")
         return cls(conn, consultas)
 
-    def _rows(self, sql, params=()):
-        cur = self.conn.cursor()
-        cur.execute(sql, params)
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+    # ---- estrutura e consultas
+
+    def _carregar(self):
+        """(Re)lê a estrutura da base. Chama-se ao arrancar e quando uma consulta falha por tabela ou coluna inexistente
+        (por exemplo, depois de uma atualização do Primavera)."""
+        self._cache = {}
+        try:
+            self.esquema = Esquema(descobrir.ler_esquema(self.conn))
+        except Exception as e:  # noqa: BLE001
+            self.esquema = None
+            log.warning("Não consegui ler a estrutura da base (%s); uso as consultas de origem.", str(e)[:160])
+
+    def consulta(self, papel):
+        if papel in self.manuais:
+            return Consulta(self.manuais[papel], RESERVA[papel].extra if papel in RESERVA else {})
+        if papel not in self._cache:
+            self._cache[papel] = self._construir(papel)
+        return self._cache[papel]
+
+    def _construir(self, papel):
+        if self.esquema is None:
+            return RESERVA[papel]
+        antes = len(self.esquema.notas)
+        if papel in esquema.BUILDERS:
+            c = esquema.BUILDERS[papel](self.esquema)
+        else:
+            c = self._stock(papel)
+        for nota in self.esquema.notas[antes:]:
+            self.notas.append(f"{papel}: {nota}")
+            log.warning("Estrutura da base (%s): %s", papel, nota)
+        return c
+
+    def _corre(self, sql, params=()):
+        try:
+            cur = self.conn.cursor()
+            cur.execute(f"SELECT TOP 1 * FROM ({sql}) x", params)
+            cur.fetchall()
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _stock(self, papel):
+        """Armazéns, existências e movimentos: a consulta de origem se funcionar nesta base; senão procura as tabelas certas."""
+        origem = RESERVA[papel]
+        if self._corre(origem.sql, ["1900-01-01"] if "?" in origem.sql else []):
+            return origem
+        candidatas = descobrir.propor(self.esquema.tabelas)[papel][:3]
+        for p in candidatas:
+            descobrir.validar(self.conn, p)
+        escolhida = descobrir.escolher(candidatas)
+        if escolhida is None:
+            raise ErroEsquema(f"não encontrei na base nenhuma tabela de {papel} de stock")
+        self.esquema.notas.append(f"a consulta de origem não serve nesta base; uso a tabela {escolhida.tabela.nome}"
+                                  + ("".join(f" ({a})" for a in escolhida.avisos)))
+        return Consulta(escolhida.sql)
+
+    def relatorio(self):
+        """Texto com o que o sync percebeu da base: tabela escolhida, avisos e erros de cada consulta."""
+        linhas = []
+        for papel in ORDEM:
+            try:
+                c = self.consulta(papel)
+                linhas.append(f"{papel}: OK" + (" (consulta manual)" if papel in self.manuais else ""))
+                linhas.append("    " + " ".join(c.sql.split())[:400])
+            except ErroEsquema as e:
+                linhas.append(f"{papel}: FALTA — {e}")
+        if self.notas:
+            linhas.append("Avisos:")
+            linhas += [f"    {n}" for n in self.notas]
+        return "\n".join(linhas)
+
+    # ---- execução
+
+    def _rows(self, papel, preparar):
+        """`preparar(consulta)` devolve (sql, parâmetros). Se a base disser que uma tabela ou coluna não existe, relê a
+        estrutura e tenta uma vez mais com a consulta reconstruída."""
+        for tentativa in (1, 2):
+            sql, params = preparar(self.consulta(papel))
+            try:
+                cur = self.conn.cursor()
+                cur.execute(sql, params)
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, r)) for r in cur.fetchall()]
+            except Exception as e:  # noqa: BLE001
+                if tentativa == 1 and papel not in self.manuais and estrutura_mudou(e):
+                    log.warning("A estrutura da base mudou (%s); a ler de novo e a reconstruir as consultas.", str(e)[:160])
+                    self._carregar()
+                    continue
+                raise
 
     def documentos(self, tipos, desde=None):
         """Cabeçalhos dos documentos dos tipos dados (códigos do Primavera: FA, FR, VD, NC…), desde uma data."""
-        filtro, params = ("AND c.Data >= ?", [*tipos, desde]) if desde else ("", list(tipos))
-        sql = DOCUMENTOS_SQL.format(tipos=",".join("?" * len(tipos)), filtro_data=filtro)
-        docs = self._rows(sql, params)
+        def preparar(c):
+            filtro, params = (c.extra.get("filtro_data", ""), [*tipos, desde]) if desde else ("", list(tipos))
+            return c.sql.format(tipos=",".join("?" * len(tipos)), filtro_data=filtro), params
+        docs = self._rows("documentos", preparar)
         for d in docs:
             d["Id"] = str(d["Id"]).upper()
         return docs
@@ -99,7 +220,7 @@ class Evolution:
         """Linhas por documento: {IdCabecDoc: [linhas]}."""
         out = {}
         for lote in _lotes(ids):
-            for r in self._rows(LINHAS_SQL.format(ids=",".join("?" * len(lote))), lote):
+            for r in self._rows("linhas", lambda c: (c.sql.format(ids=",".join("?" * len(lote))), lote)):
                 r["IdCabecDoc"] = str(r["IdCabecDoc"]).upper()
                 if r["IdCabecDocOrigem"] is not None:
                     r["IdCabecDocOrigem"] = str(r["IdCabecDocOrigem"]).upper()
@@ -109,29 +230,29 @@ class Evolution:
     def clientes(self, codigos):
         out = {}
         for lote in _lotes(codigos):
-            for r in self._rows(CLIENTES_SQL.format(codigos=",".join("?" * len(lote))), lote):
+            for r in self._rows("clientes", lambda c: (c.sql.format(codigos=",".join("?" * len(lote))), lote)):
                 out[r["Cliente"]] = r
         return out
 
     def artigos(self, codigos):
         out = {}
         for lote in _lotes(codigos):
-            for r in self._rows(ARTIGOS_SQL.format(codigos=",".join("?" * len(lote))), lote):
+            for r in self._rows("artigos_codigos", lambda c: (c.sql.format(codigos=",".join("?" * len(lote))), lote)):
                 out[r["Artigo"]] = r
         return out
 
     def catalogo(self, moeda):
         """Todos os artigos, com o preço na moeda dada."""
-        return self._rows(self.consultas["artigos"], [moeda])
+        return self._rows("artigos", lambda c: (c.sql, [moeda] * c.sql.count("?")))
 
     def armazens(self):
-        return self._rows(self.consultas["armazens"])
+        return self._rows("armazens", lambda c: (c.sql, []))
 
     def existencias(self):
-        return self._rows(self.consultas["existencias"])
+        return self._rows("existencias", lambda c: (c.sql, []))
 
     def movimentos(self, desde):
-        rows = self._rows(self.consultas["movimentos"], [desde])
+        rows = self._rows("movimentos", lambda c: (c.sql, [desde]))
         for r in rows:
             r["Id"] = str(r["Id"]).upper()
         return rows
