@@ -570,7 +570,7 @@ def passo_teste(empresa, config):
     except Exception as e:  # noqa: BLE001
         erro(f"o teste falhou: {type(e).__name__}: {e}")
         return False
-    (ok if bem else erro)("teste de envio " + ("concluído" if bem else "com erros"))
+    (ok if bem else erro)("teste de envio " + ("concluído" if bem else "falhou: nada chegou à Lonntra"))
     return bem
 
 

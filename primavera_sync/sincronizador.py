@@ -490,7 +490,9 @@ def verificar(cfg):
 
 
 def imprimir_teste(r, n):
-    """Mostra o resultado de Sincronizador.amostra. Devolve True se chegou alguma coisa e nada foi recusado."""
+    """Mostra o resultado de Sincronizador.amostra. Devolve True se a instalação pode continuar: chegou alguma coisa à
+    Lonntra, ou não havia nada a recusar. Itens recusados um a um (ex.: artigo com uma taxa de IVA que a Lonntra não
+    tem) são avisos com o motivo, não uma falha da instalação: o resto foi enviado e esses repetem-se a cada ciclo."""
     d = r["documentos"]
     print(f"  Documentos: {d['enviados']} enviados, {d['erros']} com erro" +
           (f" (e {d['ja_enviados']} dos recentes já estavam enviados)" if d["ja_enviados"] else ""))
@@ -502,16 +504,25 @@ def imprimir_teste(r, n):
         nomes = {"artigos": "Artigos", "armazens": "Armazéns", "movimentos": "Movimentos de stock", "existencias": "Existências"}
         for k, v in r["catalogo"].items():
             print(f"  {nomes.get(k, k)}: {v} enviados")
-    for item, msg in r["erros"]:
-        print(f"  ERRO {item}: {msg}")
     total = d["enviados"] + sum((r["catalogo"] or {}).values())
     if r["erros"]:
-        print("  Alguns itens foram recusados pela Lonntra (acima). Corrija e volte a testar com --teste.")
+        motivos = {}
+        for item, msg in r["erros"]:
+            motivos.setdefault(str(msg), []).append(item)
+        print(f"  {len(r['erros'])} item(ns) recusado(s) pela Lonntra, por estes motivos:")
+        for msg, itens in sorted(motivos.items(), key=lambda m: -len(m[1])):
+            print(f"      {len(itens)}x {msg}  (ex.: {', '.join(itens[:3])})")
+    if total == 0 and r["erros"]:
+        print("  Nada chegou à Lonntra. Corrija os motivos acima e volte a testar com --teste.")
+        return False
+    if r["erros"]:
+        print(f"  Chegaram {total} itens; os recusados repetem-se a cada ciclo e resolvem-se na Lonntra (ver o motivo), "
+              "sem impedir a instalação.")
     elif total == 0:
         print("  Nada novo para enviar (já estava tudo enviado, ou o Primavera não tem esses dados).")
     else:
         print(f"  Conferir na Lonntra: os {total} itens acima (até {n} de cada tipo) devem aparecer em Faturação e em Artigos/Stock.")
-    return not r["erros"]
+    return True
 
 
 def _amostra(fonte, tipos):

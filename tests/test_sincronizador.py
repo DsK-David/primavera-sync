@@ -1,6 +1,7 @@
 import configparser
 import tempfile
 import unittest
+from unittest import mock
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -325,3 +326,27 @@ class AmostraTest(unittest.TestCase):
         r = self.s.amostra(10)
         self.assertEqual(r["documentos"]["erros"], 1)
         self.assertEqual(len(r["erros"]), 1)
+
+
+class ImprimirTesteTest(unittest.TestCase):
+    def resultado(self, enviados=10, erros=(), catalogo=None):
+        return {"documentos": {"enviados": enviados, "erros": 0, "numeros": [], "ja_enviados": 0},
+                "catalogo": {"artigos": 0} if catalogo is None else catalogo, "erros": list(erros)}
+
+    def test_recusas_parciais_nao_falham_a_instalacao(self):
+        from primavera_sync.sincronizador import imprimir_teste
+        r = self.resultado(10, [("artigo X", "Não há taxa de IVA de 6%"), ("artigo Y", "Não há taxa de IVA de 6%")])
+        with mock.patch("builtins.print") as imprime:
+            self.assertTrue(imprimir_teste(r, 10))
+        texto = " ".join(str(c.args[0]) for c in imprime.call_args_list)
+        self.assertIn("2x Não há taxa de IVA de 6%", texto)
+
+    def test_nada_chegou_e_ha_recusas_falha(self):
+        from primavera_sync.sincronizador import imprimir_teste
+        with mock.patch("builtins.print"):
+            self.assertFalse(imprimir_teste(self.resultado(0, [("FA 1", "motivo")]), 10))
+
+    def test_nada_a_enviar_sem_erros_nao_falha(self):
+        from primavera_sync.sincronizador import imprimir_teste
+        with mock.patch("builtins.print"):
+            self.assertTrue(imprimir_teste(self.resultado(0), 10))
