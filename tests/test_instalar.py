@@ -145,3 +145,16 @@ class VariasEmpresasTest(unittest.TestCase):
             self.assertEqual(cfg["sincronizacao"]["log"], str(Path("empresas") / "custom" / "primavera-sync.log"))
             self.assertEqual(cfg["consultas"]["existencias"], "SELECT 1 AS Artigo")
             self.assertEqual(cfg["consultas"]["armazens"], "")
+
+
+class NomeEMoedaTest(unittest.TestCase):
+    def test_parece_id(self):
+        self.assertTrue(instalar.parece_id("006f0d7f-0ae4-4457-affe-0bbc0ca0c9ec"))
+        self.assertFalse(instalar.parece_id("Auto Style"))
+        self.assertFalse(instalar.parece_id(""))
+
+    def test_moeda_proposta_e_o_escudo_nao_o_euro(self):
+        self.assertEqual(instalar.sugerir_moeda([("EUR", "Euro"), ("CVE", "Escudo de Cabo Verde")]), "CVE")
+        self.assertEqual(instalar.sugerir_moeda([("EUR", "Euro"), ("ECV", "Escudo cabo-verdiano")]), "ECV")
+        self.assertEqual(instalar.sugerir_moeda([("EUR", "Euro"), ("USD", "Dólar")]), "CVE")
+        self.assertEqual(instalar.sugerir_moeda([]), "CVE")

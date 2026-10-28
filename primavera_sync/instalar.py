@@ -124,6 +124,21 @@ def slug(nome, chave=""):
     return t or (chave[:8] or "empresa")
 
 
+def parece_id(texto):
+    """A Lonntra devolve às vezes o ID da empresa (UUID) em vez do nome."""
+    return bool(re.fullmatch(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", (texto or "").strip()))
+
+
+def sugerir_moeda(moedas, usos=None):
+    """Código da moeda em escudos de Cabo Verde entre (codigo, descricao); sem correspondência, 'CVE'.
+    A Lonntra só recebe escudos: a moeda mais usada nos artigos pode ser o euro, por isso não é ela que se propõe."""
+    for codigo, desc in moedas:
+        texto = _sem_acentos(f"{codigo} {desc}")
+        if re.search(r"escudo|cabo.?verde|\bcve\b|\becv\b|\bcve", texto):
+            return str(codigo).strip()
+    return "CVE"
+
+
 @dataclass
 class Empresa:
     url: str
@@ -216,7 +231,9 @@ def passo_lonntra(cliente):
             try:
                 r = Lonntra(url, chave).estado()
                 nome = r.get("empresa") or ""
-                ok(f"chave aceite ({url}, empresa {nome})")
+                if parece_id(nome):  # só o ID: o nome vem da empresa escolhida no Primavera
+                    nome = ""
+                ok(f"chave aceite ({url}, chave {chave[:8]}…" + (f", empresa {nome})" if nome else ")"))
                 if any(e.chave == chave for e in empresas):
                     break
                 empresas.append(Empresa(url, chave, nome))
@@ -313,9 +330,10 @@ def bases_primavera(admin):
     return bases, nomes
 
 
-def passo_base(admin, alvo, pedida="", usadas=()):
-    """Escolhe a base da empresa `alvo` (nome na Lonntra). `usadas`: bases já atribuídas a outras empresas."""
-    titulo(f"Empresa no Primavera: {alvo}" if alvo else "Empresa no Primavera")
+def passo_base(admin, alvo, pedida="", usadas=(), rotulo=""):
+    """Escolhe a base da empresa `alvo` (nome na Lonntra, se se souber). `rotulo`: como identificar a chave no ecrã.
+    `usadas`: bases já atribuídas a outras chaves. Devolve (base, nome da empresa no Primavera)."""
+    titulo(f"Empresa no Primavera: {alvo or rotulo}" if (alvo or rotulo) else "Empresa no Primavera")
     todas, nomes = bases_primavera(admin)
     bases = [b for b in todas if b not in usadas]
     if pedida:
@@ -327,10 +345,13 @@ def passo_base(admin, alvo, pedida="", usadas=()):
     elif len(bases) == 1:
         base = bases[0]
     else:
+        if rotulo:
+            print(f"    Qual destas empresas do Primavera é a da {rotulo}?")
         padrao = melhor_base(bases, nomes, alvo)
         base = bases[escolher("Base da empresa", [f"{b}  {nomes.get(b.upper(), '')}".strip() for b in bases], padrao)]
-    ok(f"base: {base} {nomes.get(base.upper(), '')}".rstrip())
-    return base
+    nome = nomes.get(base.upper(), "")
+    ok(f"base: {base} {nome}".rstrip())
+    return base, nome
 
 
 def passo_login(admin, driver, servidor, base, senha=None):
@@ -414,13 +435,21 @@ def passo_codigos(admin, base, cliente):
         servicos = perguntar("Que tipos são serviços (sem stock)? Separe por vírgulas", ",".join(propostos))
     ok(f"serviços: tipo(s) {servicos or 'nenhum'}")
 
-    # moeda dos preços
-    try:
-        moeda = cur.execute("SELECT TOP 1 Moeda FROM ArtigoMoeda GROUP BY Moeda ORDER BY COUNT(*) DESC").fetchone()
-        moeda = (moeda[0] if moeda else "CVE").strip()
-    except Exception:  # noqa: BLE001
-        moeda = "CVE"
-    ok(f"moeda dos preços: {moeda}")
+    # moeda dos preços e dos documentos: a Lonntra só recebe escudos
+    moeda = cliente.get("sincronizacao", "moeda", fallback=None)
+    if moeda is None:
+        try:
+            moedas = [(str(r[0]).strip(), str(r[1] or "").strip()) for r in cur.execute("SELECT Moeda, Descricao FROM Moedas")]
+        except Exception:  # noqa: BLE001 - sem a tabela de moedas: propõe só o código
+            moedas = []
+        proposta = sugerir_moeda(moedas)
+        try:
+            usos = cur.execute("SELECT Moeda, COUNT(*) FROM CabecDoc WHERE TipoEntidade = 'C' GROUP BY Moeda ORDER BY 2 DESC").fetchall()
+            print("    Moedas dos documentos de venda: " + ", ".join(f"{str(m).strip()} ({n})" for m, n in usos))
+        except Exception:  # noqa: BLE001
+            pass
+        moeda = perguntar("Código da moeda em escudos no Primavera (só se enviam documentos nesta moeda)", proposta)
+    ok(f"moeda dos preços e dos documentos: {moeda}")
     return mapa_tipos, mapa_modos, servicos, moeda
 
 
@@ -556,12 +585,14 @@ def main():
         driver, servidor, admin = passo_sql(cliente)
         senha = secrets.token_urlsafe(18) + "aA9"  # a mesma para todas as bases: o login de leitura é um só
         usadas, dados = [], []
-        for e in empresas:
-            e.pasta, e.tarefa = pasta_da_empresa(e.chave, e.nome)
+        for n, e in enumerate(empresas, 1):
             pedida = cliente.get("primavera", "base", fallback="") if len(empresas) == 1 else ""
-            alvo = e.nome or cliente.get("cliente", "nome", fallback="")
-            base = passo_base(admin, alvo, pedida, usadas)
+            alvo = e.nome or (cliente.get("cliente", "nome", fallback="") if len(empresas) == 1 else "")
+            rotulo = f"chave {n} ({e.chave[:8]}…)"
+            base, nome_base = passo_base(admin, alvo, pedida, usadas, rotulo)
             usadas.append(base)
+            e.nome = e.nome or nome_base or base
+            e.pasta, e.tarefa = pasta_da_empresa(e.chave, e.nome)
             ligacao, windows = passo_login(admin, driver, servidor, base, senha)
             mapa_tipos, mapa_modos, servicos, moeda = passo_codigos(admin, base, cliente)
             catalogo, movimentos, consultas = passo_stock(
