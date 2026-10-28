@@ -202,7 +202,11 @@ def passo_lonntra(cliente):
     titulo("Lonntra")
     url = cliente.get("lonntra", "url", fallback="") or perguntar("Endereço da Lonntra", "https://app.lonntra.cv")
     chaves = separar_chaves(cliente.get("lonntra", "chave", fallback=""))
-    if not chaves:
+    if chaves:
+        print(f"    O cliente.ini tem {len(chaves)} chave(s).")
+        mais = separar_chaves(perguntar("Chaves de outras empresas deste servidor (separadas por vírgulas; Enter = nenhuma)"))
+        chaves += [k for k in mais if k not in chaves]
+    else:
         chaves = separar_chaves(perguntar("Chave(s) da empresa (php yii integracao/chave <NIF>); várias, separadas por vírgulas"))
     if not chaves:
         raise SystemExit("Sem uma chave não dá para continuar.")
@@ -396,14 +400,17 @@ def passo_codigos(admin, base, cliente):
     # tipos de artigo que são serviços
     servicos = cliente.get("sincronizacao", "tipos_artigo_servico", fallback=None)
     if servicos is None:
-        tipos_art = cur.execute("SELECT TipoArtigo, COUNT(*) FROM Artigo GROUP BY TipoArtigo ORDER BY 2 DESC").fetchall()
         propostos = []
-        print("    Tipos de artigo no Primavera:")
-        for t, n in tipos_art:
-            ex = [r[0] for r in cur.execute("SELECT TOP 6 Descricao FROM Artigo WHERE TipoArtigo = ? ORDER BY Artigo", t).fetchall()]
-            if parece_servico(ex):
-                propostos.append(str(t).strip())
-            print(f"      tipo {str(t).strip():<4} {n:>7} artigos   ex.: {'; '.join((e or '')[:22] for e in ex[:3])}")
+        try:
+            tipos_art = cur.execute("SELECT TipoArtigo, COUNT(*) FROM Artigo GROUP BY TipoArtigo ORDER BY 2 DESC").fetchall()
+            print("    Tipos de artigo no Primavera:")
+            for t, n in tipos_art:
+                ex = [r[0] for r in cur.execute("SELECT TOP 6 Descricao FROM Artigo WHERE TipoArtigo = ? ORDER BY Artigo", t).fetchall()]
+                if parece_servico(ex):
+                    propostos.append(str(t).strip())
+                print(f"      tipo {str(t).strip():<4} {n:>7} artigos   ex.: {'; '.join((e or '')[:22] for e in ex[:3])}")
+        except Exception as e:  # noqa: BLE001 - outra versão do Primavera: pergunta sem a lista
+            aviso(f"não consegui listar os tipos de artigo ({str(e)[:140]}).")
         servicos = perguntar("Que tipos são serviços (sem stock)? Separe por vírgulas", ",".join(propostos))
     ok(f"serviços: tipo(s) {servicos or 'nenhum'}")
 
@@ -517,6 +524,27 @@ def escrever_config(url, chave, ligacao, mapa_tipos, mapa_modos, servicos, moeda
     return destino
 
 
+def passo_teste(empresa, config):
+    """Envia 10 de cada coisa e diz se chegou. O resto do histórico fica para o horário escolhido."""
+    from .evolution import Evolution
+    from .lonntra import ErroLigacao, Lonntra
+    from .sincronizador import Estado, Sincronizador, imprimir_teste, ler_config
+    titulo(f"Teste de envio: {empresa.nome}")
+    cfg = ler_config(str(config))
+    try:
+        sinc = Sincronizador(Evolution.ligar(cfg["primavera"]["ligacao"], dict(cfg["consultas"])),
+                             Lonntra(cfg["lonntra"]["url"], cfg["lonntra"]["chave"]), Estado(cfg["sincronizacao"]["estado"]), cfg)
+        bem = imprimir_teste(sinc.amostra(10), 10)
+    except ErroLigacao as e:
+        erro(f"a Lonntra não respondeu: {e}")
+        return False
+    except Exception as e:  # noqa: BLE001
+        erro(f"o teste falhou: {type(e).__name__}: {e}")
+        return False
+    (ok if bem else erro)("teste de envio " + ("concluído" if bem else "com erros"))
+    return bem
+
+
 def main():
     print(f"Instalador do primavera-sync {__version__} (Primavera ERP -> Lonntra)")
     relatorio.append(f"Instalação do primavera-sync {__version__} em {socket.gethostname()}, {datetime.now():%d/%m/%Y %H:%M}")
@@ -545,19 +573,28 @@ def main():
         horario = cliente.get("sincronizacao", "historico_horario", fallback=None)
         if horario is None:
             print("    O histórico todo lê anos de documentos e pesa no Primavera durante uns minutos (ou horas).")
-            horario = "" if sim("Enviar o histórico já, sem esperar pela noite?", False) else "20-7"
+            print("    Por isso corre à noite; antes disso vai só o teste de 10 de cada coisa, mais os últimos 30 dias.")
+            hora = perguntar("A que horas começa o histórico? (hora de 0 a 23, ou «ja» para já)", "18").lower()
+            if hora.startswith("j"):
+                horario = ""
+            else:
+                hora = int(hora) if hora.isdigit() and 0 <= int(hora) <= 23 else 18
+                horario = f"{hora}-7"
         ok("histórico: " + (f"entre as {horario.split('-')[0]}h e as {horario.split('-')[1]}h" if horario else "já"))
 
         titulo("Verificação final")
         from .sincronizador import ler_config, verificar
+        quero_teste = sim("Depois de verificar, enviar já 10 documentos, 10 artigos, etc. para confirmar que chegam à Lonntra?")
         bem, manifesto = True, []
         for e, ligacao, mapa_tipos, mapa_modos, servicos, moeda, catalogo, movimentos, consultas in dados:
             print(f"\n  -- {e.nome or e.chave[:8]}")
             config = escrever_config(e.url, e.chave, ligacao, mapa_tipos, mapa_modos, servicos, moeda, catalogo, movimentos,
                                      horario, e.pasta, consultas)
             este = verificar(ler_config(str(config)))
-            bem = bem and este
             (ok if este else erro)(f"{e.nome}: " + ("tudo verificado" if este else "a verificação tem erros (ver acima)"))
+            if este and quero_teste:
+                este = passo_teste(e, config)
+            bem = bem and este
             rel = e.pasta.relative_to(PASTA)
             manifesto.append({"nome": e.nome, "tarefa": e.tarefa, "config": str(rel / "config.ini"),
                               "log": str(rel / "primavera-sync.log")})
@@ -568,6 +605,12 @@ def main():
         return 1
     except KeyboardInterrupt:
         erro("interrompido")
+        return 1
+    except Exception as e:  # noqa: BLE001 - qualquer outro erro (ex.: coluna que não existe nesta versão) fica no relatório
+        import traceback
+        erro(f"{type(e).__name__}: {e}")
+        relatorio.append(traceback.format_exc())
+        print("    O erro completo está em relatorio-instalacao.txt; mande-o para corrigir.")
         return 1
     finally:
         (PASTA / "relatorio-instalacao.txt").write_text("\n".join(relatorio) + "\n", encoding="utf-8")

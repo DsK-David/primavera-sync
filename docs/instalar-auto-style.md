@@ -39,8 +39,9 @@ O instalador, por esta ordem:
 | Acesso | cria o login `lonntra_leitura` (só leitura, palavra-passe gerada) ou, se o SQL Server só aceitar Windows, dá leitura à conta SYSTEM | — |
 | Códigos | mostra os tipos de documento e propõe FT/FR/TV/NC/ND; propõe os métodos de pagamento; mostra os tipos de artigo com exemplos | confirmar os tipos (Enter); quais tipos de artigo são serviços |
 | Stock | experimenta as consultas do catálogo e do stock. Se a base for de outra versão, **varre a base** (`descobrir.py`) à procura das tabelas de armazéns, existências e movimentos e propõe as consultas; o que não houver fica desligado | confirmar a tabela proposta |
-| Histórico | — | enviar já ou à noite (por omissão: entre as 20h e as 7h) |
+| Histórico | — | a que horas começa (por omissão **18h**; corre das 18h às 7h) ou «ja» para já |
 | Verificação | escreve o `config.ini` e corre o `--verificar` | — |
+| Teste de envio | envia **10 documentos (os mais recentes), 10 artigos, 10 armazéns, 10 movimentos e 10 existências** e lista o que foi, para conferires na Lonntra antes de sair. O resto do histórico fica para o horário escolhido. Pode repetir-se depois com `python -m primavera_sync.sincronizador config.ini --teste [N]` | confirmar (por omissão sim) |
 | Arranque | cria uma tarefa por empresa (com o Windows, como SYSTEM, reinicia se parar), arranca-as e espera pelo primeiro ciclo de cada uma | — |
 
 No fim mostra o resultado, que também fica em `C:\primavera-sync\relatorio-instalacao.txt`.

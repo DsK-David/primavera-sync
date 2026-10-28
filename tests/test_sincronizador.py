@@ -1,7 +1,7 @@
 import configparser
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from primavera_sync.lonntra import ErroApi, ErroLigacao
@@ -262,3 +262,66 @@ class SinalTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AmostraTest(unittest.TestCase):
+    """O teste de envio do instalador: no máximo N de cada coisa, sem contar como carga completa."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = configparser.ConfigParser(interpolation=None)
+        self.cfg.read(CONFIG, encoding="utf-8")
+        self.cfg["sincronizacao"]["historico_horario"] = "18-7"
+        self.fonte, self.api = FontePrimavera(), LonntraFalsa()
+        self.estado = Estado(str(Path(self.tmp.name) / "estado.db"))
+        self.s = Sincronizador(self.fonte, self.api, self.estado, self.cfg)
+        self.fonte.clientes_ = {"C001": {"Cliente": "C001", "Nome": "Cliente", "NumContrib": "212345678"}}
+        hoje = date.today()
+        self.fonte.docs = [doc(f"D{i}", "FA", i, 1150, data=hoje - timedelta(days=30 - i)) for i in range(1, 26)]
+        self.fonte.linhas_ = {f"D{i}": [linha(f"D{i}", "PNEU", 1, 1000)] for i in range(1, 26)}
+        self.fonte.artigos_ = {"PNEU": {"Artigo": "PNEU", "Descricao": "Pneu", "TipoArtigo": "3"}}
+        self.fonte.catalogo_ = [{"Artigo": f"A{i}", "Descricao": f"Artigo {i}", "TipoArtigo": "3", "Taxa": 15, "Familia": "F",
+                                 "Anulado": 0, "Custo": 1, "PVP": 2, "PVPComIva": 0} for i in range(30)]
+        self.fonte.armazens_ = [{"Armazem": f"{i}", "Descricao": f"Armazém {i}"} for i in range(15)]
+        self.fonte.existencias_ = [{"Artigo": f"A{i}", "Armazem": "1", "Quantidade": 5} for i in range(30)]
+        self.fonte.movimentos_ = [{"Id": f"M{i}", "Artigo": "A1", "Armazem": "1", "Data": hoje - timedelta(days=i),
+                                   "EntradaSaida": "E", "Quantidade": 1, "Documento": "X"} for i in range(1, 25)]
+
+    def tearDown(self):
+        self.estado.conn.close()
+        self.tmp.cleanup()
+
+    def test_envia_no_maximo_dez_de_cada(self):
+        r = self.s.amostra(10)
+        self.assertEqual(r["documentos"]["enviados"], 10)
+        self.assertEqual(r["catalogo"], {"artigos": 10, "armazens": 10, "movimentos": 10, "existencias": 10})
+        self.assertEqual(r["erros"], [])
+        self.assertEqual(len(self.api.pedidos), 10)
+
+    def test_documentos_sao_os_mais_recentes(self):
+        r = self.s.amostra(10)
+        self.assertEqual(r["documentos"]["numeros"][-1], "FA 2026/25")
+        self.assertEqual(r["documentos"]["numeros"][0], "FA 2026/16")
+
+    def test_nao_conta_como_carga_completa(self):
+        self.s.amostra(10)
+        self.assertIsNone(self.estado.marca("carga_documentos"))
+        self.assertIsNone(self.estado.marca("carga_movimentos"))
+
+    def test_o_resto_segue_depois_sem_repetir_o_teste(self):
+        self.s.amostra(10)
+        self.s.catalogo()
+        self.assertEqual(sum(len(p["movimentos"]) for p in self.api.pedidos_stock if p["movimentos"]), 24)
+        self.s.documentos()
+        self.assertEqual(len({p["documento"]["id"] for p in self.api.pedidos}), 25, "cada documento vai uma vez")
+
+    def test_catalogo_desligado(self):
+        self.cfg["sincronizacao"]["catalogo"] = "nao"
+        self.assertIsNone(self.s.amostra(10)["catalogo"])
+
+    def test_erros_da_lonntra_aparecem(self):
+        self.fonte.docs = [doc("X", "FA", 1, 100, data=date.today())]
+        self.fonte.linhas_ = {"X": [linha("X", "PNEU", 1, 100, taxa=4)]}
+        r = self.s.amostra(10)
+        self.assertEqual(r["documentos"]["erros"], 1)
+        self.assertEqual(len(r["erros"]), 1)

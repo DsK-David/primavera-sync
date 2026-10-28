@@ -203,15 +203,16 @@ class Sincronizador:
 
     # ---- catálogo e stock (ADR-061, fase 3)
 
-    def catalogo(self, completo=False):
-        """Envia os artigos, armazéns, movimentos e existências que mudaram desde o último envio."""
-        r = {"artigos": self._artigos()}
-        r.update(self._stock(completo))
+    def catalogo(self, completo=False, limite=None):
+        """Envia os artigos, armazéns, movimentos e existências que mudaram desde o último envio.
+        `limite`: no máximo tantos de cada (teste de envio); não conta como carga completa."""
+        r = {"artigos": self._artigos(limite)}
+        r.update(self._stock(completo, limite))
         if any(r.values()):
             log.info("Catálogo e stock: %s.", ", ".join(f"{v} {k}" for k, v in r.items() if v))
         return r
 
-    def _artigos(self):
+    def _artigos(self, limite=None):
         servicos = {t.strip() for t in self.s.get("tipos_artigo_servico", "").split(",") if t.strip()}
         feitos = self.estado.catalogo("artigo")
         novos = {}
@@ -239,19 +240,21 @@ class Sincronizador:
             if feitos.get(codigo) != impressao:
                 novos[codigo] = (item, impressao)
         enviados = 0
-        for parte in _partes(list(novos.values())):
+        for parte in _partes(list(novos.values())[:limite]):
             r = self.lonntra.artigos([i for i, _ in parte])
             erros = self._erros("artigo", r)
             self.estado.guardar_catalogo("artigo", {i["codigo"]: h for i, h in parte if i["codigo"] not in erros})
             enviados += len(parte) - len(erros)
         return enviados
 
-    def _stock(self, completo):
+    def _stock(self, completo, limite=None):
         r = {"armazens": 0, "movimentos": 0, "existencias": 0}
 
         feitos = self.estado.catalogo("armazem")
         armazens = {_txt(a["Armazem"]): _txt(a.get("Descricao")) for a in self.fonte.armazens() if _txt(a.get("Armazem"))}
         novos = {k: v for k, v in armazens.items() if feitos.get(k) != v}
+        if limite:
+            novos = dict(list(novos.items())[:limite])
         if novos:
             self.lonntra.stock(armazens=[{"codigo": k, "nome": v} for k, v in novos.items()])
             self.estado.guardar_catalogo("armazem", novos)
@@ -270,11 +273,13 @@ class Sincronizador:
             movimentos.append({"id": m["Id"], "artigo": _txt(m["Artigo"]), "armazem": _txt(m.get("Armazem")),
                                "data": _data(m["Data"]), "tipo": tipo, "quantidade": abs(_num(m["Quantidade"])),
                                "documento": _txt(m.get("Documento")) or None})
+        if limite:  # os mais recentes
+            movimentos = sorted(movimentos, key=lambda m: m["data"] or "")[-limite:]
         for parte in _partes(movimentos):
             erros = self._erros("movimento", self.lonntra.stock(movimentos=parte))
             self.estado.guardar_catalogo("movimento", {m["id"]: "" for m in parte if m["id"] not in erros})
             r["movimentos"] += len(parte) - len(erros)
-        if carga and movimentos_ativos:
+        if carga and movimentos_ativos and not limite:
             self._carga_feita("movimentos")
 
         feitos = self.estado.catalogo("existencia")
@@ -285,6 +290,7 @@ class Sincronizador:
             if feitos.get(chave) != valor:
                 existencias[chave] = valor
         lista = [{"artigo": k.split("|")[0], "armazem": k.split("|")[1], "quantidade": float(v)} for k, v in existencias.items()]
+        lista = lista[:limite]
         for parte in _partes(lista):
             erros = self._erros("existencia", self.lonntra.stock(existencias=parte))
             ok = {f"{e['artigo']}|{e['armazem']}": existencias[f"{e['artigo']}|{e['armazem']}"] for e in parte
@@ -318,13 +324,21 @@ class Sincronizador:
             log.info("Nada de novo no Primavera.")
             return {"documentos": 0, "erros": 0}
         log.info("%d documento(s) por enviar%s.", len(docs), f" desde {desde}" if desde else "")
+        enviados, erros, _ = self._enviar_documentos(docs)
+        if carga:
+            self._carga_feita("documentos")
+        log.info("Ciclo terminado: %d enviado(s), %d com erro.", enviados, erros)
+        return {"documentos": enviados, "erros": erros}
 
+    def _enviar_documentos(self, docs):
+        """Envia estes documentos. Devolve (enviados, com erro, números dos enviados)."""
         linhas = self.fonte.linhas([d["Id"] for d in docs])
         clientes = self.fonte.clientes({d["Entidade"] for d in docs if d["Entidade"]})
         artigos = self.fonte.artigos({l["Artigo"] for ls in linhas.values() for l in ls})
         servicos = {t.strip() for t in self.s.get("tipos_artigo_servico", "").split(",") if t.strip()}
 
         enviados = erros = 0
+        numeros = []
         for d in docs:
             numero = f"{d['TipoDoc']} {d['Serie']}/{d['NumDoc']}"
             try:
@@ -340,10 +354,29 @@ class Sincronizador:
                 log.warning("%s: %s", numero, aviso)
             log.info("%s %s.", numero, "já estava na Lonntra" if r.get("ja_existia") else "enviado")
             enviados += 1
-        if carga:
-            self._carga_feita("documentos")
-        log.info("Ciclo terminado: %d enviado(s), %d com erro.", enviados, erros)
-        return {"documentos": enviados, "erros": erros}
+            numeros.append(numero)
+        return enviados, erros, numeros
+
+    # ---- teste de envio
+
+    def amostra(self, n=10):
+        """Envia no máximo `n` de cada coisa (documentos mais recentes, artigos, armazéns, movimentos, existências) para
+        confirmar que os dados chegam à Lonntra. Não conta como carga completa: o resto segue o horário normal.
+        Devolve {"documentos": {"enviados", "erros", "numeros"}, "catalogo": {...}, "erros": [(item, mensagem)]}."""
+        antes = {r[0] for r in self.estado.resumo()[1]}
+        feitos, tentativas = self.estado.enviados(), self.estado.tentativas()
+        recentes = self.fonte.documentos(list(self.tipos), date.today() - timedelta(days=90)) \
+            or self.fonte.documentos(list(self.tipos), None)
+        docs = [d for d in recentes if d["Id"] not in feitos and tentativas.get(d["Id"], 0) < self.max_tentativas][-n:]
+        enviados, erros, numeros = self._enviar_documentos(docs) if docs else (0, 0, [])
+        out = {"documentos": {"enviados": enviados, "erros": erros, "numeros": numeros,
+                              "ja_enviados": len([d for d in recentes if d["Id"] in feitos])}}
+        if _txt(self.s.get("catalogo", "sim")).lower() in ("nao", "não", "no", "false", "0", "off"):
+            out["catalogo"] = None
+        else:
+            out["catalogo"] = self.catalogo(limite=n)
+        out["erros"] = [(r[0], r[1]) for r in self.estado.resumo()[1] if r[0] not in antes]
+        return out
 
     def corpo(self, d, linhas, clientes, artigos, servicos):
         moeda = self.s.get("moeda", "CVE")
@@ -454,6 +487,31 @@ def verificar(cfg):
     return ok
 
 
+def imprimir_teste(r, n):
+    """Mostra o resultado de Sincronizador.amostra. Devolve True se chegou alguma coisa e nada foi recusado."""
+    d = r["documentos"]
+    print(f"  Documentos: {d['enviados']} enviados, {d['erros']} com erro" +
+          (f" (e {d['ja_enviados']} dos recentes já estavam enviados)" if d["ja_enviados"] else ""))
+    for numero in d["numeros"]:
+        print(f"      {numero}")
+    if r["catalogo"] is None:
+        print("  Artigos e stock: desligados no config.ini")
+    else:
+        nomes = {"artigos": "Artigos", "armazens": "Armazéns", "movimentos": "Movimentos de stock", "existencias": "Existências"}
+        for k, v in r["catalogo"].items():
+            print(f"  {nomes.get(k, k)}: {v} enviados")
+    for item, msg in r["erros"]:
+        print(f"  ERRO {item}: {msg}")
+    total = d["enviados"] + sum((r["catalogo"] or {}).values())
+    if r["erros"]:
+        print("  Alguns itens foram recusados pela Lonntra (acima). Corrija e volte a testar com --teste.")
+    elif total == 0:
+        print("  Nada novo para enviar (já estava tudo enviado, ou o Primavera não tem esses dados).")
+    else:
+        print(f"  Conferir na Lonntra: os {total} itens acima (até {n} de cada tipo) devem aparecer em Faturação e em Artigos/Stock.")
+    return not r["erros"]
+
+
 def _amostra(fonte, tipos):
     docs = fonte.documentos(tipos, date.today() - timedelta(days=90))[-5:]
     if not docs:
@@ -470,6 +528,8 @@ def main(argv=None):
     p.add_argument("--verificar", action="store_true", help="testa a ligação, as consultas e a chave, sem enviar nada")
     p.add_argument("--uma-vez", action="store_true", help="corre um ciclo e sai")
     p.add_argument("--completo", action="store_true", help="revê todos os documentos e movimentos, não só os recentes")
+    p.add_argument("--teste", nargs="?", const=10, type=int, metavar="N",
+                   help="envia só N (10) documentos, artigos, armazéns, movimentos e existências para confirmar que chegam")
     p.add_argument("--estado", action="store_true", help="mostra o que foi enviado e os erros")
     p.add_argument("--repetir-erros", action="store_true", help="volta a tentar os documentos que esgotaram as tentativas")
     a = p.parse_args(argv)
@@ -503,6 +563,9 @@ def main(argv=None):
     lonntra = Lonntra(cfg["lonntra"]["url"], cfg["lonntra"]["chave"])
     from .evolution import Evolution
     consultas = dict(cfg["consultas"]) if cfg.has_section("consultas") else {}
+    if a.teste:
+        sys.exit(0 if imprimir_teste(Sincronizador(Evolution.ligar(cfg["primavera"]["ligacao"], consultas), lonntra, estado, cfg)
+                                     .amostra(a.teste), a.teste) else 1)
     intervalo = s.getint("intervalo", 60)
     completo = a.completo
     sinc = None
