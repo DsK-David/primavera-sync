@@ -7,3 +7,4 @@ config.ini
 /cliente.ini
 relatorio-instalacao.txt
 logs/
+clientes/*/cliente.ini
