@@ -439,10 +439,17 @@ def verificar(cfg):
     semana = date.today() - timedelta(days=7)
     passo(f"documentos {', '.join(tipos)} (últimos 7 dias)", lambda: f"{len(fonte.documentos(tipos, semana))} documentos")
     passo("linhas e clientes", lambda: _amostra(fonte, tipos))
-    passo("artigos", lambda: f"{len(fonte.catalogo(s.get('moeda', 'CVE')))} artigos")
-    passo("armazéns", lambda: ", ".join(_txt(a['Armazem']) for a in fonte.armazens()) or "nenhum")
-    passo("existências", lambda: f"{len(fonte.existencias())} linhas")
-    passo("movimentos de stock (últimos 7 dias)", lambda: f"{len(fonte.movimentos(semana))} movimentos")
+    desligado = ("nao", "não", "no", "false", "0", "off")
+    if _txt(s.get("catalogo", "sim")).lower() in desligado:
+        print("  --   catálogo e stock desligados no config.ini: não testados")
+    else:
+        passo("artigos", lambda: f"{len(fonte.catalogo(s.get('moeda', 'CVE')))} artigos")
+        passo("armazéns", lambda: ", ".join(_txt(a['Armazem']) for a in fonte.armazens()) or "nenhum")
+        passo("existências", lambda: f"{len(fonte.existencias())} linhas")
+        if _txt(s.get("movimentos_stock", "sim")).lower() in desligado:
+            print("  --   movimentos de stock desligados no config.ini: não testados")
+        else:
+            passo("movimentos de stock (últimos 7 dias)", lambda: f"{len(fonte.movimentos(semana))} movimentos")
     print("Tudo certo." if ok else "Há erros: corrija o config.ini ([primavera], [lonntra] ou [consultas]) e volte a verificar.")
     return ok
 

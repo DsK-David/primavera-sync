@@ -4,12 +4,13 @@
 #  2. instala o Python 3.12 (se faltar) e o pyodbc
 #  3. corre o assistente (python -m primavera_sync.instalar): descobre o Primavera, cria o login de leitura,
 #     propõe os mapas, escreve o config.ini e verifica tudo
-#  4. cria a tarefa «PrimaveraLonntra» (arranca com o Windows, como SYSTEM, e reinicia se parar) e arranca-a
-#  5. espera pelo primeiro ciclo e mostra o resultado; tudo fica em relatorio-instalacao.txt
+#  4. cria uma tarefa por empresa («PrimaveraLonntra» para a instalação antiga, «PrimaveraLonntra-<empresa>» para as
+#     outras; arrancam com o Windows, como SYSTEM, e reiniciam se pararem) e arranca-as
+#  5. espera pelo primeiro ciclo de cada uma e mostra o resultado; tudo fica em relatorio-instalacao.txt
 param([string]$Destino = "C:\primavera-sync")
 
 $ErrorActionPreference = "Stop"
-$Tarefa = "PrimaveraLonntra"
+$Prefixo = "PrimaveraLonntra"
 $PythonUrl = "https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe"
 
 function Titulo($t) { Write-Host ""; Write-Host "== $t" -ForegroundColor Cyan }
@@ -30,7 +31,7 @@ Titulo "Ficheiros"
 New-Item -ItemType Directory -Force -Path $Destino, "$Destino\logs" | Out-Null
 if ((Resolve-Path $Origem).Path -ne (Resolve-Path $Destino).Path) {
     Copy-Item -Recurse -Force "$Origem\primavera_sync" $Destino
-    foreach ($f in "config.example.ini", "instalar.bat", "instalar.ps1", "estado.bat", "desinstalar.bat", "cliente.ini") {
+    foreach ($f in "config.example.ini", "instalar.bat", "instalar.ps1", "estado.bat", "estado.ps1", "desinstalar.bat", "cliente.ini") {
         if (Test-Path "$Origem\$f") { Copy-Item -Force "$Origem\$f" $Destino }
     }
 }
@@ -72,54 +73,68 @@ if (-not $drivers) { Falha "não há nenhum driver ODBC do SQL Server. Instale o
 Ok ("drivers ODBC: " + ($drivers -join ", "))
 
 # ---------------------------------------------------------------- 3. assistente
-$antes = Get-ScheduledTask -TaskName $Tarefa -ErrorAction SilentlyContinue
-if ($antes) { Stop-ScheduledTask -TaskName $Tarefa -ErrorAction SilentlyContinue; Aviso "a tarefa que já existia foi parada para reconfigurar" }
+$antes = Get-ScheduledTask -TaskName "$Prefixo*" -ErrorAction SilentlyContinue
+if ($antes) { $antes | Stop-ScheduledTask -ErrorAction SilentlyContinue; Aviso "as tarefas que já existiam foram paradas para reconfigurar" }
+Remove-Item "$Destino\instalacao.json" -ErrorAction SilentlyContinue
 Push-Location $Destino
 & $Py -m primavera_sync.instalar
 $resultado = $LASTEXITCODE
 Pop-Location
 if ($resultado -ne 0) { Falha "a configuração não ficou completa (ver acima e $Destino\relatorio-instalacao.txt). Corrija e corra o instalar.bat outra vez." }
+$empresas = @(Get-Content "$Destino\instalacao.json" -Raw -Encoding UTF8 | ConvertFrom-Json)
 
-# ---------------------------------------------------------------- 4. arranque automático
+# ---------------------------------------------------------------- 4. arranque automático (uma tarefa por empresa)
 Titulo "Arranque automático"
-$acao = New-ScheduledTaskAction -Execute $Py -Argument "-m primavera_sync.sincronizador config.ini" -WorkingDirectory $Destino
 $gatilho = New-ScheduledTaskTrigger -AtStartup
 $gatilho.Delay = "PT2M"   # dá tempo ao SQL Server de arrancar
 $definicoes = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -MultipleInstances IgnoreNew
 $quem = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-Register-ScheduledTask -TaskName $Tarefa -Action $acao -Trigger $gatilho -Settings $definicoes -Principal $quem `
-    -Description "primavera-sync: envia documentos, artigos e stock do Primavera para a Lonntra (só leitura)." -Force | Out-Null
-Start-ScheduledTask -TaskName $Tarefa
-Ok "tarefa «$Tarefa»: arranca com o Windows, como SYSTEM, e volta a arrancar se parar"
-
-# ---------------------------------------------------------------- 5. primeiro ciclo
-Titulo "Primeiro ciclo"
-$log = "$Destino\primavera-sync.log"
-$visto = $false
-for ($i = 0; $i -lt 36 -and -not $visto; $i++) {
-    Start-Sleep -Seconds 5
-    if (Test-Path $log) {
-        $fim = Get-Content $log -Tail 40 -Encoding UTF8
-        if ($fim -match "Ciclo terminado|Nada de novo|ERROR") { $visto = $true }
-    }
+foreach ($e in $empresas) {
+    $acao = New-ScheduledTaskAction -Execute $Py -Argument "-m primavera_sync.sincronizador `"$($e.config)`"" -WorkingDirectory $Destino
+    Register-ScheduledTask -TaskName $e.tarefa -Action $acao -Trigger $gatilho -Settings $definicoes -Principal $quem `
+        -Description "primavera-sync ($($e.nome)): envia documentos, artigos e stock do Primavera para a Lonntra (só leitura)." -Force | Out-Null
+    Start-ScheduledTask -TaskName $e.tarefa
+    Ok "tarefa «$($e.tarefa)» ($($e.nome)): arranca com o Windows, como SYSTEM, e volta a arrancar se parar"
 }
-$estado = (Get-ScheduledTask -TaskName $Tarefa).State
-if (-not $visto) {
-    Aviso "ao fim de 3 minutos ainda não há um ciclo completo no log (a tarefa está: $estado). Pode estar a enviar muitos dados: ver $log"
-} elseif ($fim -match "ERROR") {
-    Aviso "o primeiro ciclo teve erros (a tarefa está: $estado). Últimas linhas:"
-    $fim | Select-Object -Last 12 | ForEach-Object { Write-Host "    $_" }
-} else {
-    Ok "a funcionar (tarefa: $estado). Últimas linhas do log:"
-    $fim | Select-Object -Last 6 | ForEach-Object { Write-Host "    $_" }
+# tarefas de empresas que já não estão na instalação (ex.: PrimaveraLonntra de antes, agora com outro nome)
+Get-ScheduledTask -TaskName "$Prefixo*" -ErrorAction SilentlyContinue | Where-Object { $empresas.tarefa -notcontains $_.TaskName } | ForEach-Object {
+    Aviso "a tarefa antiga «$($_.TaskName)» não está na instalação e foi removida"
+    Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false
+}
+
+# ---------------------------------------------------------------- 5. primeiro ciclo de cada empresa
+Titulo "Primeiro ciclo"
+$linhasRel = @()
+foreach ($e in $empresas) {
+    Write-Host "  -- $($e.nome)"
+    $log = Join-Path $Destino $e.log
+    $visto = $false
+    for ($i = 0; $i -lt 36 -and -not $visto; $i++) {
+        Start-Sleep -Seconds 5
+        if (Test-Path $log) {
+            $fim = Get-Content $log -Tail 40 -Encoding UTF8
+            if ($fim -match "Ciclo terminado|Nada de novo|ERROR") { $visto = $true }
+        }
+    }
+    $estado = (Get-ScheduledTask -TaskName $e.tarefa).State
+    if (-not $visto) {
+        Aviso "ao fim de 3 minutos ainda não há um ciclo completo no log (a tarefa está: $estado). Pode estar a enviar muitos dados: ver $log"
+    } elseif ($fim -match "ERROR") {
+        Aviso "o primeiro ciclo teve erros (a tarefa está: $estado). Últimas linhas:"
+        $fim | Select-Object -Last 12 | ForEach-Object { Write-Host "    $_" }
+    } else {
+        Ok "a funcionar (tarefa: $estado). Últimas linhas do log:"
+        $fim | Select-Object -Last 6 | ForEach-Object { Write-Host "    $_" }
+    }
+    $linhasRel += "  tarefa $($e.tarefa) ($estado), empresa $($e.nome), log: $log"
 }
 
 $rel = "$Destino\relatorio-instalacao.txt"
-Add-Content -Path $rel -Encoding UTF8 -Value "`n== Arranque automático`n  tarefa $Tarefa ($estado), Python $Py`n  log: $log"
+Add-Content -Path $rel -Encoding UTF8 -Value ("`n== Arranque automático`n  Python $Py`n" + ($linhasRel -join "`n"))
 Write-Host ""
 Write-Host "Instalação terminada. Relatório: $rel" -ForegroundColor Cyan
-Write-Host "Na Lonntra: php yii integracao/estado mostra o último contacto deste servidor."
+Write-Host "Na Lonntra: php yii integracao/estado mostra o último contacto de cada empresa."
 Write-Host "Para ver o estado mais tarde: estado.bat (nesta pasta)."
 Read-Host "Enter para fechar"

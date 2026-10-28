@@ -33,17 +33,19 @@ O instalador, por esta ordem:
 |---|---|---|
 | Ficheiros | copia o sync para `C:\primavera-sync` e fecha a pasta só para administradores | — |
 | Python | instala o Python 3.12 (se faltar) e o pyodbc; confirma o driver ODBC | — |
-| Lonntra | testa a chave do `cliente.ini` | a chave, se faltar ou estiver errada |
+| Lonntra | testa a chave do `cliente.ini`. **Pode haver várias empresas**: `chave = k1, k2` no `cliente.ini`, ou digitar as chaves separadas por vírgulas | a(s) chave(s), se faltarem ou estiverem erradas |
 | SQL Server | encontra a instância e entra com o utilizador do Windows | o login de administrador (ex.: `sa`), só se o Windows não entrar; não fica guardado |
-| Empresa | lista as bases `PRI…` com o nome da empresa | qual é, se houver várias |
+| Empresa | para cada chave, lista as bases `PRI…` com o nome da empresa (propõe a de nome igual ao da empresa na Lonntra e não repete bases já usadas) | qual é, se houver várias |
 | Acesso | cria o login `lonntra_leitura` (só leitura, palavra-passe gerada) ou, se o SQL Server só aceitar Windows, dá leitura à conta SYSTEM | — |
 | Códigos | mostra os tipos de documento e propõe FT/FR/TV/NC/ND; propõe os métodos de pagamento; mostra os tipos de artigo com exemplos | confirmar os tipos (Enter); quais tipos de artigo são serviços |
-| Stock | experimenta as consultas do catálogo e do stock; desliga o que não existir nesta versão e diz que tabelas há | — |
+| Stock | experimenta as consultas do catálogo e do stock. Se a base for de outra versão, **varre a base** (`descobrir.py`) à procura das tabelas de armazéns, existências e movimentos e propõe as consultas; o que não houver fica desligado | confirmar a tabela proposta |
 | Histórico | — | enviar já ou à noite (por omissão: entre as 20h e as 7h) |
 | Verificação | escreve o `config.ini` e corre o `--verificar` | — |
-| Arranque | cria a tarefa «PrimaveraLonntra» (com o Windows, como SYSTEM, reinicia se parar), arranca-a e espera pelo primeiro ciclo | — |
+| Arranque | cria uma tarefa por empresa (com o Windows, como SYSTEM, reinicia se parar), arranca-as e espera pelo primeiro ciclo de cada uma | — |
 
-No fim mostra o resultado, que também fica em `C:\primavera-sync\relatorio-instalacao.txt`. Se algum passo falhar, diz porquê; corrige-se e volta a correr-se o `instalar.bat` (é seguro repetir).
+No fim mostra o resultado, que também fica em `C:\primavera-sync\relatorio-instalacao.txt`.
+
+**Mais do que uma empresa no mesmo servidor.** Cada empresa tem o seu `config.ini`, `estado.db`, log e tarefa em `C:\primavera-sync\empresas\<empresa>\` (tarefa `PrimaveraLonntra-<empresa>`); a lista fica em `instalacao.json`. Uma instalação antiga (com `config.ini` na raiz e a tarefa `PrimaveraLonntra`) mantém-se como está, para não reenviar o histórico. O `estado.bat` mostra todas as empresas e o `desinstalar.bat` remove todas as tarefas. As consultas de stock podem também ser descobertas à mão: `python -m primavera_sync.descobrir <config.ini>`. Se algum passo falhar, diz porquê; corrige-se e volta a correr-se o `instalar.bat` (é seguro repetir).
 
 Depois, na pasta `C:\primavera-sync`:
 

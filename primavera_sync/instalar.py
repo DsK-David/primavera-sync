@@ -8,10 +8,12 @@ da Lonntra, e opcionalmente o servidor, a base e os mapas) e só pergunta o que 
 """
 import configparser
 import getpass
+import json
 import re
 import secrets
 import socket
 import sys
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -91,6 +93,59 @@ def _sem_acentos(t):
     return t
 
 
+def separar_chaves(texto):
+    """«k1, k2» (vírgulas, pontos e vírgulas ou espaços) -> ['k1', 'k2'], sem repetidas."""
+    vistas = []
+    for k in re.split(r"[,;\s]+", texto or ""):
+        if k and k not in vistas:
+            vistas.append(k)
+    return vistas
+
+
+def _compacto(t):
+    return re.sub(r"[^a-z0-9]", "", _sem_acentos(t))
+
+
+def melhor_base(bases, nomes, alvo):
+    """Índice da base cujo nome de empresa melhor corresponde ao alvo: igual, senão a mais parecida que o contém."""
+    a = _compacto(alvo)
+    if not a:
+        return 0
+    nomes_c = [_compacto(nomes.get(b.upper(), "")) for b in bases]
+    for i, n in enumerate(nomes_c):
+        if n == a:
+            return i
+    parecidas = [(abs(len(n) - len(a)), i) for i, n in enumerate(nomes_c) if n and (a in n or n in a)]
+    return min(parecidas)[1] if parecidas else 0
+
+
+def slug(nome, chave=""):
+    t = re.sub(r"[^a-z0-9]+", "-", _sem_acentos(nome)).strip("-")
+    return t or (chave[:8] or "empresa")
+
+
+@dataclass
+class Empresa:
+    url: str
+    chave: str
+    nome: str
+    pasta: Path = None
+    tarefa: str = "PrimaveraLonntra"
+
+
+def pasta_da_empresa(chave, nome):
+    """(pasta, tarefa). Uma instalação antiga (config.ini na raiz com esta chave) mantém a pasta e a tarefa de sempre,
+    para não perder o estado.db nem reenviar o histórico; as outras ficam em empresas/<nome>."""
+    antigo = PASTA / "config.ini"
+    if antigo.exists():
+        c = configparser.ConfigParser(interpolation=None)
+        c.read(antigo, encoding="utf-8")
+        if c.get("lonntra", "chave", fallback="") == chave:
+            return PASTA, "PrimaveraLonntra"
+    nome_pasta = slug(nome, chave)
+    return PASTA / "empresas" / nome_pasta, f"PrimaveraLonntra-{nome_pasta}"
+
+
 # ---------------------------------------------------------------- conversa
 
 def titulo(t):
@@ -142,23 +197,39 @@ def ler_cliente():
 
 
 def passo_lonntra(cliente):
+    """Valida cada chave (uma por empresa; várias separadas por vírgulas) e devolve as empresas."""
     from .lonntra import ErroLigacao, Lonntra
     titulo("Lonntra")
     url = cliente.get("lonntra", "url", fallback="") or perguntar("Endereço da Lonntra", "https://app.lonntra.cv")
-    chave = cliente.get("lonntra", "chave", fallback="")
-    for _ in range(3):
-        if not chave:
-            chave = perguntar("Chave da empresa (php yii integracao/chave <NIF>)")
-        try:
-            r = Lonntra(url, chave).estado()
-            ok(f"chave aceite ({url}, empresa {r.get('empresa')})")
-            return url, chave
-        except ErroLigacao as e:
-            erro(f"a Lonntra recusou: {e}")
-            if "401" not in str(e):
-                print("    Confirme que este servidor tem internet e abre o endereço no browser.")
-            chave = ""
-    raise SystemExit("Sem uma chave válida não dá para continuar.")
+    chaves = separar_chaves(cliente.get("lonntra", "chave", fallback=""))
+    if not chaves:
+        chaves = separar_chaves(perguntar("Chave(s) da empresa (php yii integracao/chave <NIF>); várias, separadas por vírgulas"))
+    if not chaves:
+        raise SystemExit("Sem uma chave não dá para continuar.")
+    empresas = []
+    for chave in chaves:
+        for _ in range(3):
+            try:
+                r = Lonntra(url, chave).estado()
+                nome = r.get("empresa") or ""
+                ok(f"chave aceite ({url}, empresa {nome})")
+                if any(e.chave == chave for e in empresas):
+                    break
+                empresas.append(Empresa(url, chave, nome))
+                break
+            except ErroLigacao as e:
+                erro(f"a Lonntra recusou a chave {chave[:8]}…: {e}")
+                if "401" not in str(e):
+                    print("    Confirme que este servidor tem internet e abre o endereço no browser.")
+                nova = separar_chaves(perguntar("Chave certa desta empresa"))
+                if not nova:
+                    break
+                chave = nova[0]
+        else:
+            raise SystemExit("Sem uma chave válida não dá para continuar.")
+    if not empresas:
+        raise SystemExit("Sem uma chave válida não dá para continuar.")
+    return empresas
 
 
 def instancias_locais():
@@ -238,33 +309,34 @@ def bases_primavera(admin):
     return bases, nomes
 
 
-def passo_base(admin, cliente):
-    titulo("Empresa no Primavera")
-    bases, nomes = bases_primavera(admin)
-    pedida = cliente.get("primavera", "base", fallback="")
+def passo_base(admin, alvo, pedida="", usadas=()):
+    """Escolhe a base da empresa `alvo` (nome na Lonntra). `usadas`: bases já atribuídas a outras empresas."""
+    titulo(f"Empresa no Primavera: {alvo}" if alvo else "Empresa no Primavera")
+    todas, nomes = bases_primavera(admin)
+    bases = [b for b in todas if b not in usadas]
     if pedida:
-        if pedida not in bases:
-            raise SystemExit(f"A base {pedida} (cliente.ini) não existe nesta instância. Há: {', '.join(bases)}")
+        if pedida not in todas:
+            raise SystemExit(f"A base {pedida} (cliente.ini) não existe nesta instância. Há: {', '.join(todas)}")
         base = pedida
     elif not bases:
-        raise SystemExit("Não encontrei nenhuma base do Primavera (PRI…) nesta instância.")
+        raise SystemExit("Não encontrei nenhuma base do Primavera (PRI…) livre nesta instância.")
     elif len(bases) == 1:
         base = bases[0]
     else:
-        alvo = _sem_acentos(cliente.get("cliente", "nome", fallback=""))
-        padrao = next((i for i, b in enumerate(bases) if alvo and alvo in _sem_acentos(nomes.get(b.upper(), ""))), 0)
+        padrao = melhor_base(bases, nomes, alvo)
         base = bases[escolher("Base da empresa", [f"{b}  {nomes.get(b.upper(), '')}".strip() for b in bases], padrao)]
     ok(f"base: {base} {nomes.get(base.upper(), '')}".rstrip())
     return base
 
 
-def passo_login(admin, driver, servidor, base):
+def passo_login(admin, driver, servidor, base, senha=None):
+    """`senha`: a mesma para todas as empresas da instalação (o login lonntra_leitura é um só no servidor)."""
     titulo("Acesso só de leitura")
     cur = admin.cursor()
     so_windows = cur.execute("SELECT CAST(SERVERPROPERTY('IsIntegratedSecurityOnly') AS int)").fetchone()[0] == 1
     q = base.replace("]", "]]")
     if not so_windows:
-        senha = secrets.token_urlsafe(18) + "aA9"
+        senha = senha or secrets.token_urlsafe(18) + "aA9"
         cur.execute(f"IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'{LOGIN}') "
                     f"CREATE LOGIN [{LOGIN}] WITH PASSWORD = N'{senha}', CHECK_POLICY = ON, DEFAULT_DATABASE = [{q}] "
                     f"ELSE ALTER LOGIN [{LOGIN}] WITH PASSWORD = N'{senha}'")
@@ -345,11 +417,7 @@ def passo_codigos(admin, base, cliente):
     return mapa_tipos, mapa_modos, servicos, moeda
 
 
-def passo_stock(ligacao, moeda):
-    """Experimenta as consultas do catálogo e do stock; desliga o que esta versão do Primavera não tiver."""
-    from .evolution import Evolution
-    titulo("Consultas do catálogo e do stock")
-    fonte = Evolution.ligar(ligacao)
+def _testar_stock(fonte, moeda):
     falhas = {}
     for nome, fn in (("artigos", lambda: fonte.catalogo(moeda)), ("armazéns", fonte.armazens),
                      ("existências", fonte.existencias), ("movimentos", lambda: fonte.movimentos(date.today() - timedelta(days=7)))):
@@ -358,20 +426,57 @@ def passo_stock(ligacao, moeda):
         except Exception as e:  # noqa: BLE001
             falhas[nome] = str(e)[:160]
             erro(f"{nome}: {falhas[nome]}")
+    return falhas
+
+
+PAPEL_DA_FALHA = {"armazéns": "armazens", "existências": "existencias", "movimentos": "movimentos"}
+
+
+def passo_stock(ligacao, moeda):
+    """Experimenta as consultas do catálogo e do stock. Se alguma falhar, varre a base à procura das tabelas certas
+    (descobrir.py) e propõe as consultas. Devolve (catalogo, movimentos, consultas)."""
+    from . import descobrir
+    from .evolution import Evolution
+    titulo("Consultas do catálogo e do stock")
+    consultas = {}
+    fonte = Evolution.ligar(ligacao)
+    falhas = _testar_stock(fonte, moeda)
+
+    por_papel = [PAPEL_DA_FALHA[f] for f in falhas if f in PAPEL_DA_FALHA]
+    if por_papel:
+        aviso("a base não tem as tabelas de stock de origem; a varrer a base para as encontrar…")
+        try:
+            achadas = descobrir.sugerir(fonte.conn, papeis=por_papel)
+        except Exception as e:  # noqa: BLE001
+            achadas = {}
+            erro(f"não consegui varrer a base: {str(e)[:160]}")
+        for papel in por_papel:
+            escolhida, _ = achadas.get(papel, (None, []))
+            if not escolhida:
+                aviso(f"{papel}: nenhuma tabela serve; fica desligado.")
+                continue
+            print(f"    {papel}: {escolhida.tabela.completo} ({escolhida.tabela.linhas} linhas) -> {escolhida.resultado}")
+            for a in escolhida.avisos:
+                print(f"      ! {a}")
+            if sim(f"Usar a tabela {escolhida.tabela.nome} para {papel}?"):
+                consultas[papel] = " ".join(escolhida.sql.split())
+        if consultas:
+            fonte = Evolution.ligar(ligacao, consultas)
+            ok("consultas escritas no config.ini ([consultas]); a testar de novo")
+            falhas = _testar_stock(fonte, moeda)
+
     movimentos = "movimentos" not in falhas
     catalogo = not ({"artigos", "armazéns", "existências"} & set(falhas))
     if not movimentos and catalogo:
-        aviso("os movimentos de stock ficam desligados: a tabela INV_Movimentos não existe ou é diferente nesta versão.")
-        cur = fonte.conn.cursor()
-        candidatas = [r[0] for r in cur.execute(
-            "SELECT name FROM sys.tables WHERE name LIKE '%Mov%' OR name LIKE '%STK%' OR name LIKE 'INV%' ORDER BY name")]
-        aviso("tabelas candidatas: " + (", ".join(candidatas) or "nenhuma") + " (ver [consultas] no config.ini)")
+        aviso("os movimentos de stock ficam desligados: não encontrei uma tabela que sirva.")
     if not catalogo:
         aviso("o catálogo e o stock ficam desligados; os documentos são enviados na mesma.")
-    return catalogo, movimentos
+    return catalogo, movimentos, consultas
 
 
-def escrever_config(url, chave, ligacao, mapa_tipos, mapa_modos, servicos, moeda, catalogo, movimentos, horario):
+def escrever_config(url, chave, ligacao, mapa_tipos, mapa_modos, servicos, moeda, catalogo, movimentos, horario,
+                    pasta=None, consultas=None):
+    pasta = pasta or PASTA
     exemplo = PASTA / "config.example.ini"
     cfg = configparser.ConfigParser(interpolation=None)
     cfg.optionxform = str
@@ -386,6 +491,12 @@ def escrever_config(url, chave, ligacao, mapa_tipos, mapa_modos, servicos, moeda
     s["catalogo"] = "sim" if catalogo else "não"
     s["movimentos_stock"] = "sim" if movimentos else "não"
     s["historico_horario"] = horario
+    if pasta != PASTA:  # várias empresas no mesmo servidor: cada uma com o seu estado.db e o seu log
+        rel = pasta.relative_to(PASTA)
+        s["estado"] = str(rel / "estado.db")
+        s["log"] = str(rel / "primavera-sync.log")
+    for papel, sql in (consultas or {}).items():
+        cfg["consultas"][papel] = sql
     cfg.remove_section("tipos_documento")
     cfg.add_section("tipos_documento")
     for k, v in mapa_tipos.items():
@@ -394,9 +505,10 @@ def escrever_config(url, chave, ligacao, mapa_tipos, mapa_modos, servicos, moeda
     cfg.add_section("modos_pagamento")
     for k, v in mapa_modos.items():
         cfg["modos_pagamento"][k] = v
-    destino = PASTA / "config.ini"
+    pasta.mkdir(parents=True, exist_ok=True)
+    destino = pasta / "config.ini"
     if destino.exists():
-        destino.replace(PASTA / f"config.ini.{datetime.now():%Y%m%d-%H%M%S}.bak")
+        destino.replace(pasta / f"config.ini.{datetime.now():%Y%m%d-%H%M%S}.bak")
     with open(destino, "w", encoding="utf-8") as f:
         f.write(f"# Gerado pelo instalador do primavera-sync {__version__} em {datetime.now():%d/%m/%Y %H:%M}.\n"
                 "# Tem a chave da Lonntra e a palavra-passe de leitura do SQL Server: não partilhar.\n\n")
@@ -406,19 +518,28 @@ def escrever_config(url, chave, ligacao, mapa_tipos, mapa_modos, servicos, moeda
 
 
 def main():
-    print(f"Instalador do primavera-sync {__version__} (Primavera ERP Evolution -> Lonntra)")
+    print(f"Instalador do primavera-sync {__version__} (Primavera ERP -> Lonntra)")
     relatorio.append(f"Instalação do primavera-sync {__version__} em {socket.gethostname()}, {datetime.now():%d/%m/%Y %H:%M}")
     cliente = ler_cliente()
     if cliente.has_section("cliente"):
         relatorio.append(f"Cliente: {cliente.get('cliente', 'nome', fallback='?')} (NIF {cliente.get('cliente', 'nif', fallback='?')})")
     try:
-        url, chave = passo_lonntra(cliente)
+        empresas = passo_lonntra(cliente)
         driver, servidor, admin = passo_sql(cliente)
-        base = passo_base(admin, cliente)
-        ligacao, windows = passo_login(admin, driver, servidor, base)
-        mapa_tipos, mapa_modos, servicos, moeda = passo_codigos(admin, base, cliente)
+        senha = secrets.token_urlsafe(18) + "aA9"  # a mesma para todas as bases: o login de leitura é um só
+        usadas, dados = [], []
+        for e in empresas:
+            e.pasta, e.tarefa = pasta_da_empresa(e.chave, e.nome)
+            pedida = cliente.get("primavera", "base", fallback="") if len(empresas) == 1 else ""
+            alvo = e.nome or cliente.get("cliente", "nome", fallback="")
+            base = passo_base(admin, alvo, pedida, usadas)
+            usadas.append(base)
+            ligacao, windows = passo_login(admin, driver, servidor, base, senha)
+            mapa_tipos, mapa_modos, servicos, moeda = passo_codigos(admin, base, cliente)
+            catalogo, movimentos, consultas = passo_stock(
+                ligacao if not windows else ligacao_odbc(driver, servidor, base), moeda)
+            dados.append((e, ligacao, mapa_tipos, mapa_modos, servicos, moeda, catalogo, movimentos, consultas))
         admin.close()
-        catalogo, movimentos = passo_stock(ligacao if not windows else ligacao_odbc(driver, servidor, base), moeda)
 
         titulo("Histórico")
         horario = cliente.get("sincronizacao", "historico_horario", fallback=None)
@@ -427,12 +548,20 @@ def main():
             horario = "" if sim("Enviar o histórico já, sem esperar pela noite?", False) else "20-7"
         ok("histórico: " + (f"entre as {horario.split('-')[0]}h e as {horario.split('-')[1]}h" if horario else "já"))
 
-        config = escrever_config(url, chave, ligacao, mapa_tipos, mapa_modos, servicos, moeda, catalogo, movimentos, horario)
-
         titulo("Verificação final")
         from .sincronizador import ler_config, verificar
-        bem = verificar(ler_config(str(config)))
-        (ok if bem else erro)("tudo verificado" if bem else "a verificação tem erros (ver acima)")
+        bem, manifesto = True, []
+        for e, ligacao, mapa_tipos, mapa_modos, servicos, moeda, catalogo, movimentos, consultas in dados:
+            print(f"\n  -- {e.nome or e.chave[:8]}")
+            config = escrever_config(e.url, e.chave, ligacao, mapa_tipos, mapa_modos, servicos, moeda, catalogo, movimentos,
+                                     horario, e.pasta, consultas)
+            este = verificar(ler_config(str(config)))
+            bem = bem and este
+            (ok if este else erro)(f"{e.nome}: " + ("tudo verificado" if este else "a verificação tem erros (ver acima)"))
+            rel = e.pasta.relative_to(PASTA)
+            manifesto.append({"nome": e.nome, "tarefa": e.tarefa, "config": str(rel / "config.ini"),
+                              "log": str(rel / "primavera-sync.log")})
+        (PASTA / "instalacao.json").write_text(json.dumps(manifesto, ensure_ascii=False, indent=2), encoding="utf-8")
         return 0 if bem else 1
     except SystemExit as e:
         erro(str(e))

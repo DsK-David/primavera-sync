@@ -100,3 +100,48 @@ class HistoricoTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VariasEmpresasTest(unittest.TestCase):
+    def test_separar_chaves(self):
+        self.assertEqual(instalar.separar_chaves("a.b, c.d"), ["a.b", "c.d"])
+        self.assertEqual(instalar.separar_chaves(" a ; b  c,a "), ["a", "b", "c"])
+        self.assertEqual(instalar.separar_chaves(""), [])
+
+    def test_melhor_base_prefere_o_nome_igual(self):
+        bases = ["PRIAUTOSTYLE", "PRICUSTOM", "PRIOUTRA"]
+        nomes = {"PRIAUTOSTYLE": "Auto Style, Lda", "PRICUSTOM": "Auto Style Custom", "PRIOUTRA": "Outra"}
+        self.assertEqual(instalar.melhor_base(bases, {**nomes, "PRIAUTOSTYLE": "Auto Style"}, "AutoStyle"), 0)
+        self.assertEqual(instalar.melhor_base(bases, nomes, "Auto Style Custom"), 1)
+        self.assertEqual(instalar.melhor_base(bases, nomes, "Auto Style"), 0, "contém: fica a mais curta")
+        self.assertEqual(instalar.melhor_base(bases, nomes, "Desconhecida"), 0)
+        self.assertEqual(instalar.melhor_base(bases, nomes, ""), 0)
+
+    def test_slug(self):
+        self.assertEqual(instalar.slug("Auto Style Custom, Lda."), "auto-style-custom-lda")
+        self.assertEqual(instalar.slug("Ação Ltda"), "acao-ltda")
+        self.assertEqual(instalar.slug("", "abcdef123456"), "abcdef12")
+
+    def test_pasta_da_empresa(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(instalar, "PASTA", Path(tmp)):
+            raiz = Path(tmp)
+            self.assertEqual(instalar.pasta_da_empresa("K1", "Auto Style"), (raiz / "empresas" / "auto-style", "PrimaveraLonntra-auto-style"))
+            (raiz / "config.ini").write_text("[lonntra]\nchave = K1\n", encoding="utf-8")
+            self.assertEqual(instalar.pasta_da_empresa("K1", "Auto Style"), (raiz, "PrimaveraLonntra"),
+                             "a instalação antiga mantém a pasta e a tarefa")
+            self.assertEqual(instalar.pasta_da_empresa("K2", "Auto Style Custom")[1], "PrimaveraLonntra-auto-style-custom")
+
+    def test_config_de_uma_segunda_empresa_fica_na_sua_pasta(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(instalar, "PASTA", Path(tmp)):
+            (Path(tmp) / "config.example.ini").write_text(Path(CONFIG).read_text(encoding="utf-8"), encoding="utf-8")
+            pasta = Path(tmp) / "empresas" / "custom"
+            destino = instalar.escrever_config("https://app.lonntra.cv", "K2", "DRIVER={SQL Server};DATABASE=PRIC",
+                                               {"FA": "FT"}, {}, "0", "CVE", True, True, "", pasta,
+                                               {"existencias": "SELECT 1 AS Artigo"})
+            self.assertEqual(destino, pasta / "config.ini")
+            cfg = configparser.ConfigParser(interpolation=None)
+            cfg.read(destino, encoding="utf-8")
+            self.assertEqual(cfg["sincronizacao"]["estado"], str(Path("empresas") / "custom" / "estado.db"))
+            self.assertEqual(cfg["sincronizacao"]["log"], str(Path("empresas") / "custom" / "primavera-sync.log"))
+            self.assertEqual(cfg["consultas"]["existencias"], "SELECT 1 AS Artigo")
+            self.assertEqual(cfg["consultas"]["armazens"], "")
