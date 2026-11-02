@@ -45,9 +45,28 @@ Outras opções: `--completo` revê todos os documentos, não só os dos último
 
 ### Ainda não
 
-- **Recibos** (liquidações de faturas a crédito): as faturas a crédito ficam por pagar na Lonntra até haver a rota de recibos (fase 2 do ADR-061).
+- **Recibos** (liquidações de faturas a crédito): a Lonntra **já recebe** recebimentos (`POST /integracao/primavera/recebimento`), mas o sync ainda não os lê no Primavera. Até lá, uma fatura a crédito paga depois fica «por pagar» e «vencida» na Lonntra. O que falta para o fazer está em «Recebimentos: o que falta descobrir», abaixo.
 - O tipo de cliente (coletivo/singular) sai do nome («Lda», «S.A.»…). Confirmar com a empresa.
 - Os nomes das tabelas e colunas do Primavera (`evolution.py`) são os da v10 e ainda não foram confirmados num servidor real.
+
+### Recebimentos: o que falta descobrir
+
+Para o sync enviar os recibos é preciso saber em que tabelas do Primavera da empresa ficam as **liquidações** (recibos) e o **saldo pendente** de cada documento. Os nomes mudam com a versão, por isso não se adivinham: errar aqui marcava faturas como pagas sem o estarem.
+
+**1. No SQL Server Management Studio, na base da empresa** (`USE PRI<empresa>;`), correr e guardar o resultado (tabela e colunas):
+
+```sql
+SELECT t.name AS tabela, c.name AS coluna
+FROM sys.tables t JOIN sys.columns c ON c.object_id = t.object_id
+WHERE t.name LIKE '%Liq%' OR t.name LIKE '%Pend%' OR t.name LIKE '%Receb%' OR t.name LIKE '%Recib%'
+ORDER BY t.name, c.column_id;
+```
+
+**2. Um exemplo real:** o número de uma fatura que foi paga depois (por exemplo `FA 2026/12`) e o do recibo dela (por exemplo `RE 2026/3`). Serve para conferir que o que o sync lê bate certo com o Primavera.
+
+**3. Decidir:** o sync envia só os recebimentos novos a cada ciclo, ou também reconcilia, uma vez por dia, o saldo de todas as faturas ainda em aberto? (Recomendado: as duas coisas.)
+
+Com isto escreve-se a leitura dos recebimentos no `evolution.py` (que, como o resto, se adapta aos nomes de tabela e coluna da base) e o envio para a rota da Lonntra.
 
 ## Protótipo SAF-T
 
