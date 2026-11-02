@@ -252,3 +252,81 @@ class RemotoRecebimentosTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SemRuidoEDiagnosticoTest(unittest.TestCase):
+    CNO = ["Livro", "NumeroMov", "NumeroDoc", "Entidade", "DataMov", "Moeda", "ValorLiquido", "ValorIva", "ValorRetencao", "ValorSelo",
+           "IDMovimento", "Recebido", "DataRecebimento"]
+
+    def esquema(self, *tabelas):
+        return Esquema([Tabela("dbo", n, c, 10) for n, c in tabelas])
+
+    def test_varrer_a_base_toda_nao_enche_o_relatorio_de_avisos(self):
+        outras = [(f"Tabela{i}", ["Clientes", "Documentos", "EntidadeID", "ValorLiquidado"]) for i in range(40)]
+        e = self.esquema(*outras, ("CNO_Recebimentos", self.CNO))
+        c = esquema.recebimentos(e)
+        self.assertEqual(c.extra["tabela"], "CNO_Recebimentos")
+        self.assertEqual([n for n in e.notas if "assumi" in n], [], "só nomes certos: nada a aproximar")
+
+    def test_so_aproxima_se_nao_houver_nenhuma_tabela_certa(self):
+        colunas = [c if c != "DataRecebimento" else "DataRecebimentos" for c in self.CNO]
+        e = self.esquema(("CNO_Recebimentos", colunas), ("Clientes", ["Cliente"]))
+        c = esquema.recebimentos(e)
+        self.assertEqual(c.extra["tabela"], "CNO_Recebimentos")
+        self.assertEqual(c.extra["mapa"]["data_recebimento"], "DataRecebimentos")
+
+    def test_a_consulta_guarda_o_mapa_das_colunas_para_o_diagnostico(self):
+        c = esquema.recebimentos(self.esquema(("CNO_Recebimentos", self.CNO)))
+        self.assertEqual(c.extra["mapa"]["recebido"], "Recebido")
+        self.assertEqual(c.extra["mapa"]["documento"], "NumeroDoc")
+        self.assertEqual(c.extra["esquema"], "dbo")
+
+    def test_diagnostico_diz_o_que_a_tabela_tem(self):
+        from primavera_sync.evolution import Evolution
+
+        class Cursor:
+            def __init__(self, sqls):
+                self.sqls, self.res = sqls, []
+
+            def execute(self, sql):
+                self.sqls.append(sql)
+                if sql.startswith("SELECT COUNT(*) FROM") and "IS NOT NULL" in sql:
+                    self.res = [(120,)]
+                elif sql.startswith("SELECT COUNT(*)"):
+                    self.res = [(5000,)]
+                elif sql.startswith("SELECT MIN"):
+                    self.res = [("2026-01-02", "2026-10-30")]
+                elif "GROUP BY" in sql:
+                    self.res = [("S", 120), ("N", 4880)]
+                else:
+                    self.res = [("FA 2026/12", "C001", "S", "2026-10-20", 500, 75)]
+
+            def fetchall(self):
+                return self.res
+
+        class Ligacao:
+            def __init__(self):
+                self.sqls = []
+
+            def cursor(self):
+                return Cursor(self.sqls)
+
+        ev = Evolution.__new__(Evolution)
+        ev.conn, ev.manuais, ev.notas, ev._cache, ev.opcoes = Ligacao(), {}, [], {}, {}
+        ev.esquema = self.esquema(("CNO_Recebimentos", self.CNO))
+        texto = ev.diagnostico_recebimentos()
+        for parte in ("[dbo].[CNO_Recebimentos]", "linhas: 5000", "preenchida: 120", "de 2026-01-02 a 2026-10-30", "'S' (120)", "'N' (4880)", "FA 2026/12"):
+            self.assertIn(parte, texto)
+        self.assertTrue(all(s.lstrip().upper().startswith("SELECT") for s in ev.conn.sqls), "só SELECT")
+
+    def test_o_relatorio_junta_o_diagnostico_quando_nao_leu_nada(self):
+        tmp = tempfile.TemporaryDirectory()
+        fonte, api = FontePrimavera(), LonntraFalsa()
+        fonte.diagnostico_recebimentos = lambda: "Tabela dos recebimentos: X"
+        estado = Estado(str(Path(tmp.name) / "e.db"))
+        s = Sincronizador(fonte, api, estado, cfg_com())
+        texto = s.relatorio_recebimentos()
+        self.assertIn("Porque não leu nada?", texto)
+        self.assertIn("Tabela dos recebimentos: X", texto)
+        estado.conn.close()
+        tmp.cleanup()

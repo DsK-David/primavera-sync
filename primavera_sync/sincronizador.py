@@ -271,7 +271,10 @@ class Sincronizador:
         analise, itens = self._recebimentos_lidos(None)
         if analise is None:
             return f"Consulta própria da empresa: {len(itens)} recebimentos prontos a enviar."
-        return receb.formatar(analise) + f"\nRecebimentos que seguiam (um por fatura e data): {len(itens)}"
+        texto = receb.formatar(analise) + f"\nRecebimentos que seguiam (um por fatura e data): {len(itens)}"
+        if analise["movimentos"] == 0 and hasattr(self.fonte, "diagnostico_recebimentos"):
+            texto += "\n\nPorque não leu nada?\n" + self.fonte.diagnostico_recebimentos()
+        return texto
 
     def recebimentos(self, completo=False):
         """Envia os recebimentos novos ou que mudaram. Só envia se o relatório for fiável (ver recebimentos.py)."""

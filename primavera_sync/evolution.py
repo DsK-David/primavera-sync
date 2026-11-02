@@ -286,3 +286,39 @@ class Evolution:
             filtro, params = (c.extra.get("filtro_data", ""), [desde]) if desde else ("", [])
             return c.sql.format(filtro_data=filtro), params
         return self._rows("recebimentos", preparar)
+
+    def diagnostico_recebimentos(self, amostra=5):
+        """Texto para perceber porque os recebimentos dão 0 (ou o que lá está): quantas linhas tem a tabela, que valores toma o
+        indicador de recebido, quantas têm data de recebimento e algumas linhas de exemplo. Só SELECT."""
+        c = self.consulta("recebimentos")
+        mapa, tabela = c.extra.get("mapa") or {}, c.extra.get("tabela")
+        if not mapa or not tabela:
+            return "(sem diagnóstico: a empresa usa a sua própria consulta)"
+        nome = f"[{c.extra.get('esquema', 'dbo')}].[{tabela}]"
+        col = lambda papel: f"[{mapa[papel]}]" if papel in mapa else None  # noqa: E731
+        cur = self.conn.cursor()
+        out = [f"Tabela dos recebimentos: {nome}"]
+
+        def uma(sql):
+            cur.execute(sql)
+            return cur.fetchall()
+        try:
+            out.append(f"  linhas: {uma(f'SELECT COUNT(*) FROM {nome}')[0][0]}")
+            if col("data_recebimento"):
+                d = col("data_recebimento")
+                out.append(f"  com {mapa['data_recebimento']} preenchida: {uma(f'SELECT COUNT(*) FROM {nome} WHERE {d} IS NOT NULL')[0][0]}")
+                r = uma(f"SELECT MIN({d}), MAX({d}) FROM {nome} WHERE {d} IS NOT NULL")[0]
+                out.append(f"  datas de recebimento: de {str(r[0])[:10]} a {str(r[1])[:10]}")
+            if col("recebido"):
+                rec = col("recebido")
+                valores = uma(f"SELECT TOP 12 CAST({rec} AS varchar(30)), COUNT(*) FROM {nome} GROUP BY {rec} ORDER BY 2 DESC")
+                out.append(f"  valores de {mapa['recebido']}: " + ", ".join(f"{v!r} ({n})" for v, n in valores))
+            campos = [(papel, col(papel)) for papel in ("documento", "entidade", "recebido", "data_recebimento", "data_mov", "moeda", "liquido", "iva", "retencao")
+                      if col(papel)]
+            ordem = col("data_recebimento") or col("data_mov") or campos[0][1]
+            linhas = uma(f"SELECT TOP {int(amostra)} {', '.join(c for _, c in campos)} FROM {nome} ORDER BY {ordem} DESC")
+            out.append("  últimas linhas (" + ", ".join(p for p, _ in campos) + "):")
+            out += ["    " + " | ".join(str(v)[:19] for v in linha) for linha in linhas]
+        except Exception as e:  # noqa: BLE001
+            out.append(f"  (o diagnóstico falhou: {str(e)[:200]})")
+        return "\n".join(out)

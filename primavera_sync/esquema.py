@@ -49,8 +49,9 @@ class Esquema:
                 return t
         return None
 
-    def coluna(self, tabela, candidatos):
-        """Nome real da coluna: igual a um candidato (ignorando maiúsculas, acentos e «_»), senão a mais parecida."""
+    def coluna(self, tabela, candidatos, aproximar=True):
+        """Nome real da coluna: igual a um candidato (ignorando maiúsculas, acentos e «_»), senão a mais parecida
+        (`aproximar=False`: só os iguais, para varrer tabelas sem fazer ruído)."""
         if tabela is None:
             return None
         por_norm = {}
@@ -59,6 +60,8 @@ class Esquema:
         for cand in candidatos:
             if _norm(cand) in por_norm:
                 return por_norm[_norm(cand)]
+        if not aproximar:
+            return None
         for cand in candidatos:
             parecidos = difflib.get_close_matches(_norm(cand), list(por_norm), n=1, cutoff=0.88)
             if parecidos:
@@ -289,13 +292,18 @@ def recebimentos(e, nome_tabela=None):
     """Os movimentos já recebidos: procura a tabela pelas colunas (ou pelo nome, se a empresa o indicar em
     [recebimentos] tabela). O `{filtro_data}` filtra pela data do recebimento."""
     achadas = []
-    for t in e.tabelas:
-        if nome_tabela and _norm(t.nome) != _norm(nome_tabela):
-            continue
-        m = {papel: e.coluna(t, candidatos) for papel, candidatos in RECEBIMENTOS.items()}
-        if all(m[p] for p in RECEBIMENTOS_OBRIGATORIOS):
-            pontos = 50 + (30 if re.search(r"recib|receb", t.nome, re.IGNORECASE) else 0) + 3 * sum(1 for v in m.values() if v)
-            achadas.append((pontos, t, m))
+    for aproximar in (False, True):  # primeiro só os nomes certos; só se não houver nenhuma tabela é que se aproxima
+        for t in e.tabelas:
+            if nome_tabela and _norm(t.nome) != _norm(nome_tabela):
+                continue
+            m = {papel: e.coluna(t, candidatos, aproximar=False) for papel, candidatos in RECEBIMENTOS.items()}
+            if aproximar:
+                m = {papel: m[papel] or e.coluna(t, candidatos, aproximar=True) for papel, candidatos in RECEBIMENTOS.items()}
+            if all(m[p] for p in RECEBIMENTOS_OBRIGATORIOS):
+                pontos = 50 + (30 if re.search(r"recib|receb", t.nome, re.IGNORECASE) else 0) + 3 * sum(1 for v in m.values() if v)
+                achadas.append((pontos, t, m))
+        if achadas:
+            break
     if not achadas:
         onde = f"«{nome_tabela}»" if nome_tabela else "com as colunas NumeroDoc, Recibido, DataRecebimento e ValorLiquido"
         raise ErroEsquema(f"não encontrei a tabela dos recebimentos {onde} (indique-a em [recebimentos] tabela = … no config.ini)")
@@ -305,7 +313,8 @@ def recebimentos(e, nome_tabela=None):
            f"WHERE COALESCE(CAST(t.[{m['recebido']}] AS varchar(10)), '') IN {RECEBIDO_SIM} "
            f"AND t.[{m['data_recebimento']}] IS NOT NULL {{filtro_data}} ORDER BY t.[{m['data_recebimento']}]")
     e.notas.append(f"recebimentos: uso a tabela {t.nome}")
-    return Consulta(sql, {"filtro_data": f"AND t.[{m['data_recebimento']}] >= ?", "tabela": t.nome})
+    return Consulta(sql, {"filtro_data": f"AND t.[{m['data_recebimento']}] >= ?", "tabela": t.nome, "esquema": t.esquema,
+                          "mapa": {papel: real for papel, real in m.items() if real}})
 
 
 BUILDERS = {
