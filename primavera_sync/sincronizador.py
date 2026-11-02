@@ -828,7 +828,8 @@ def main(argv=None):
         return sinc
 
     segredos = [cfg["lonntra"].get("chave", "")] + re.findall(r"(?i)PWD=\{?([^;}]+)", cfg["primavera"].get("ligacao", ""))
-    ctx = remoto.Contexto(cfg, a.config, estado, enviar_sinal, obter_sinc, segredos)
+    empresa_id = cfg["lonntra"].get("chave", "").split(".")[0]  # a chave é «<empresa>.<segredo>»
+    ctx = remoto.Contexto(cfg, a.config, estado, enviar_sinal, obter_sinc, segredos, empresa_id, Path.cwd())
     while True:
         erro_ciclo = None
         try:

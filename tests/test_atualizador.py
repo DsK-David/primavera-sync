@@ -305,3 +305,96 @@ class SemCriptografiaTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(TEM_CRYPTO, "precisa de «cryptography»")
+class AtualizarLauncherTest(unittest.TestCase):
+    """O pacote traz um launcher.py: troca-se depois de passar o --autoteste, e uma falha nunca desfaz a atualização do sync."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.empresa = self.base / "empresas" / "custom"
+        self.empresa.mkdir(parents=True)
+        (self.empresa / "config.ini").write_text("[lonntra]\n", encoding="utf-8")
+        self.privada = Ed25519PrivateKey.generate()
+        raw = self.privada.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        (self.base / "chaves.json").write_text(json.dumps({"chaves": [base64.b64encode(raw).decode()]}), encoding="utf-8")
+        # a versão que corre: 1.2.0, série 10
+        atual = self.base / "versoes" / "1.2.0" / "primavera_sync"
+        atual.mkdir(parents=True)
+        (atual / "__init__.py").write_text("", encoding="utf-8")
+        (self.base / "versoes" / "1.2.0" / "VERSAO.json").write_text(json.dumps({"versao": "1.2.0", "serie": 10}), encoding="utf-8")
+        (self.empresa / "atual.txt").write_text("1.2.0", encoding="utf-8")
+        self.estado = Estado(":memory:")
+        self.comandos = []
+        self.agora = 1000.0
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def executar(self, comando, **kw):
+        self.comandos.append(comando)
+        return SimpleNamespace(returncode=self.codigo_teste if hasattr(self, "codigo_teste") else 0, stdout="", stderr="falhou aqui")
+
+    def atualizador(self, conteudo=b""):
+        self.lonntra = LonntraFalsa(conteudo)
+        return Atualizador(self.base, self.empresa, self.empresa / "config.ini", self.lonntra, self.estado,
+                           agora=lambda: self.agora, executar=self.executar)
+
+    def oferta(self, conteudo, versao="1.3.0", serie=11, assinar=True, privada=None, sha=None):
+        sha = sha or hashlib.sha256(conteudo).hexdigest()
+        assinatura = base64.b64encode((privada or self.privada).sign(manifesto_bytes(versao, serie, sha))).decode()
+        return {"versao": versao, "serie": serie, "sha256": sha, "assinatura": assinatura if assinar else "AAAA", "requer": {"python": "3.9"}}
+
+    def atual(self):
+        return (self.empresa / "atual.txt").read_text(encoding="utf-8")
+
+
+    def pacote_com_launcher(self, launcher_texto):
+        return pacote("1.3.0", 11, extra={"launcher.py": launcher_texto})
+
+    def test_launcher_novo_que_passa_o_autoteste_substitui_o_antigo_e_guarda_o_anterior(self):
+        (self.base / "launcher.py").write_text("# launcher antigo", encoding="utf-8")
+        conteudo = self.pacote_com_launcher("# launcher novo")
+        a = self.atualizador(conteudo)
+        self.assertEqual(a.tratar(self.oferta(conteudo)), "aplicada")
+        self.assertEqual((self.base / "launcher.py").read_text(encoding="utf-8"), "# launcher novo")
+        self.assertEqual((self.base / "launcher.py.anterior").read_text(encoding="utf-8"), "# launcher antigo")
+        autoteste = [c for c in self.comandos if "--autoteste" in c]
+        self.assertEqual(len(autoteste), 1)
+        self.assertEqual(autoteste[0][-1], str(self.base), "com a pasta da instalação")
+        self.assertTrue(autoteste[0][1].endswith("launcher.py") and "1.3.0" in autoteste[0][1], "é o launcher NOVO que se testa")
+        self.assertFalse((self.base / "launcher.py.novo").exists())
+
+    def test_launcher_igual_nao_se_mexe(self):
+        (self.base / "launcher.py").write_text("# o mesmo", encoding="utf-8")
+        conteudo = self.pacote_com_launcher("# o mesmo")
+        self.atualizador(conteudo).tratar(self.oferta(conteudo))
+        self.assertFalse((self.base / "launcher.py.anterior").exists())
+        self.assertFalse(any("--autoteste" in c for c in self.comandos))
+
+    def test_launcher_que_falha_o_autoteste_fica_de_fora_mas_o_sync_atualiza(self):
+        (self.base / "launcher.py").write_text("# launcher antigo", encoding="utf-8")
+        conteudo = self.pacote_com_launcher("# launcher partido")
+        a = self.atualizador(conteudo)
+        executar = a.executar
+
+        def falha_so_o_autoteste(comando, **kw):
+            if "--autoteste" in comando:
+                self.comandos.append(comando)
+                return SimpleNamespace(returncode=1, stdout="", stderr="ERRO ao importar")
+            return executar(comando, **kw)
+        a.executar = falha_so_o_autoteste
+        with self.assertLogs("primavera_sync", level="WARNING"):
+            self.assertEqual(a.tratar(self.oferta(conteudo)), "aplicada")
+        self.assertEqual(self.atual(), "1.3.0", "a versão do sync mudou")
+        self.assertEqual((self.base / "launcher.py").read_text(encoding="utf-8"), "# launcher antigo", "o launcher antigo continua")
+        self.assertIn("autoteste", self.estado.resumo()[1][0][1])
+
+    def test_pacote_sem_launcher_nao_toca_no_da_pasta(self):
+        (self.base / "launcher.py").write_text("# antigo", encoding="utf-8")
+        conteudo = pacote("1.3.0", 11)
+        self.atualizador(conteudo).tratar(self.oferta(conteudo))
+        self.assertEqual((self.base / "launcher.py").read_text(encoding="utf-8"), "# antigo")
+

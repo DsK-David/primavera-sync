@@ -46,6 +46,7 @@ def construir_zip(versao, serie, destino):
             info.external_attr = 0o644 << 16
             z.writestr(info, dados)
         escrever("VERSAO.json", json.dumps({"versao": versao, "serie": serie}, sort_keys=True))
+        escrever("launcher.py", (RAIZ / "launcher.py").read_bytes())  # o launcher atualiza-se com o pacote (atualizador.atualizar_launcher)
         for f in ficheiros:
             escrever(f.relative_to(RAIZ).as_posix(), f.read_bytes())
     return destino

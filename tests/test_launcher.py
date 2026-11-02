@@ -309,3 +309,64 @@ class AutotesteTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LauncherAtualizadoTest(unittest.TestCase):
+    """O launcher.py da pasta mudou (veio num pacote do sync): o em marcha passa o comando ao novo."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        (self.base / "empresas" / "x").mkdir(parents=True)
+        (self.base / "empresas" / "x" / "config.ini").write_text("[lonntra]\n", encoding="utf-8")
+        self.logs = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def novo(self):
+        return Launcher(self.base, "empresas/x/config.ini", log=self.logs.append, relatar=lambda t: None)
+
+    def test_sem_launcher_na_pasta_ou_igual_ao_carregado_nao_muda(self):
+        l = self.novo()
+        self.assertFalse(l.launcher_mudou(), "sem launcher.py na pasta")
+        (self.base / "launcher.py").write_bytes(Path(launcher.__file__).read_bytes())
+        self.assertFalse(l.launcher_mudou(), "igual ao que está a correr")
+
+    def test_launcher_diferente_na_pasta_conta_como_atualizado(self):
+        l = self.novo()
+        (self.base / "launcher.py").write_text("# outro launcher", encoding="utf-8")
+        self.assertTrue(l.launcher_mudou())
+
+    def test_passa_o_comando_ao_launcher_novo_e_espera_por_ele(self):
+        l = self.novo()
+        (self.base / "launcher.py").write_text("# outro", encoding="utf-8")
+        lancados = []
+
+        class Novo:
+            def wait(self):
+                return 0
+
+        l.lancar_launcher = lambda cmd, cwd=None: (lancados.append((cmd, cwd)), Novo())[1]
+        l.filho = Filho()
+        self.assertEqual(l.correr(dormir=lambda s: None), 0)
+        self.assertEqual(len(lancados), 1)
+        cmd, cwd = lancados[0]
+        self.assertEqual(cmd[1:], [str(self.base / "launcher.py"), str(self.base / "empresas" / "x" / "config.ini")])
+        self.assertEqual(cwd, str(self.base))
+        self.assertTrue(l.filho is None, "o sync foi parado antes de passar o comando")
+
+    def test_o_autoteste_aceita_a_pasta_da_instalacao_como_argumento(self):
+        base = self.base
+        pacote = base / "primavera_sync"
+        pacote.mkdir()
+        (pacote / "__init__.py").write_text('__version__ = "7.7.7"', encoding="utf-8")
+        (pacote / "sincronizador.py").write_text("__version__ = '7.7.7'", encoding="utf-8")
+        # como o atualizador o corre: o launcher NOVO, que está noutra pasta, a verificar a instalação
+        outra = base / "versoes" / "9.9.9"
+        outra.mkdir(parents=True)
+        (outra / "launcher.py").write_bytes(Path(launcher.__file__).read_bytes())
+        r = launcher.subprocess.run([sys.executable, str(outra / "launcher.py"), "--autoteste", str(base / "empresas" / "x" / "config.ini"), str(base)],
+                                    capture_output=True, text=True, cwd=str(base))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("sync 7.7.7", r.stdout)

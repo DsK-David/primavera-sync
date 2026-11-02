@@ -461,3 +461,27 @@ O comando chega no próximo sinal de vida (de minuto a minuto; com o servidor fe
 Configuração (o sync reinicia sozinho ao recebê-la): `integracao/config 210038381 intervalo 120`, `integracao/config 210038381 intervalo -` (remove), `integracao/config 210038381` (lista). Só estas chaves: `intervalo` (30–3600 s), `revisao_dias` (1–365), `catalogo` e `movimentos_stock` (sim/não), `historico_horario` (ex.: `18-7`) e `tipos_artigo_servico` (ex.: `0,5`). Ficam no `config.remoto.ini` do cliente e sobrepõem-se ao `config.ini`.
 
 **O que não se muda à distância, de propósito:** a ligação ao SQL, a chave, o endereço, a moeda e as consultas SQL. O sync não confia na Lonntra para o que corre no SQL Server do cliente: uma consulta nova entra numa **versão assinada** (`scripts/publicar.py`). Cada valor e cada comando é validado outra vez no próprio sync.
+
+## Explorar a base do cliente à distância (SQL assinado)
+
+Para perceber a base do Primavera de uma empresa sem ir ao servidor, corre-se uma consulta de **leitura** no SQL Server dela a partir do Mac:
+
+```
+~/.primavera-sync/venv/bin/python scripts/sql_remoto.py 283048808 "SELECT TOP 20 name FROM sys.tables WHERE name LIKE 'CNO%'"
+~/.primavera-sync/venv/bin/python scripts/sql_remoto.py 283048808 --ficheiro consulta.sql --linhas 300 --espera 240
+```
+
+O script assina o pedido com a chave privada, envia-o pela Lonntra, espera o resultado (volta no sinal de vida seguinte; com o servidor fechado, só quando ele ligar) e mostra-o. Regras, todas conferidas **no sync**, que não confia na Lonntra:
+
+- a consulta vai **assinada** (Ed25519, a mesma chave das versões) com a empresa, o id do comando e a validade (1 hora por omissão, no máximo 7 dias). Sem a chave privada, ninguém lê a base de um cliente, nem com a Lonntra comprometida;
+- só **uma** instrução `SELECT` ou `WITH`, sem comentários nem `;` no meio, sem `INSERT`, `UPDATE`, `DELETE`, `INTO`, `EXEC`, `USE`, `DECLARE`, `xp_`, `sp_` e afins (as palavras entre aspas ou parênteses retos não contam);
+- corre no login **só de leitura** (`db_datareader`), sem bloquear o Primavera (`READ UNCOMMITTED`), com limite de **500 linhas**, **30 s** e **20 KB** de resultado;
+- o texto do resultado sai sem palavras-passe nem chaves.
+
+Usar de preferência consultas de **estrutura** (`sys.tables`, `sys.columns`), contagens e valores distintos; evitar trazer linhas com dados pessoais.
+
+## O launcher atualiza-se sozinho
+
+O pacote de cada versão do sync leva o `launcher.py`. Depois de aplicar a versão, o atualizador compara-o com o instalado e, se for diferente, corre o `--autoteste` do launcher **novo** (com a versão nova como alvo); só se passar é que o troca, guardando o anterior em `launcher.py.anterior`. O launcher em marcha vê que o ficheiro mudou, pára o sync, arranca o novo como processo filho (preso ao mesmo grupo de processos) e fica à espera dele. Uma falha no launcher não desfaz a atualização do sync: fica registada e o launcher antigo continua.
+
+Como o launcher que está a correr no servidor hoje (1.2.0) ainda tem o defeito da cópia antiga do `primavera_sync` à frente, **a primeira vez** que se instala esta versão tem de ser à mão (`instalar.bat` com o ZIP do GitHub). Daí para a frente, é tudo à distância.

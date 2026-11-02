@@ -2,16 +2,20 @@
 vigia-o. É a única peça que não se atualiza sozinha: só biblioteca standard, pequeno, e quase nunca muda.
 
     python launcher.py empresas\\<empresa>\\config.ini        (é o que a tarefa do Windows corre)
-    python launcher.py --autoteste [config.ini]              (verifica que consegue arrancar; não arranca nada)
+    python launcher.py --autoteste [config.ini] [pasta]      (verifica que consegue arrancar; não arranca nada)
 
 Faz quatro coisas:
   1. arranca `python -m primavera_sync.sincronizador <config>` com a versão de `versoes\\<v>` (o `atual.txt` da empresa);
   2. se o filho morre, espera 10 s, 30 s, 1 min, 5 min… antes de o voltar a arrancar (e nunca em tempestade);
   3. depois de mudar de versão, se a nova não der um ciclo bom em 10 min, ou morrer 3 vezes, volta à anterior,
      marca a nova como FALHOU e avisa a Lonntra (mesmo que a nova nem chegue a arrancar);
-  4. se o `atual.txt` mudar, reinicia o filho na versão nova (é assim que uma atualização se aplica).
+  4. se o `atual.txt` mudar, reinicia o filho na versão nova (é assim que uma atualização se aplica);
+  5. se o próprio launcher.py for substituído (o atualizador põe lá o do pacote novo, depois de ele passar o --autoteste), arranca o
+     novo como processo filho e fica à espera dele (preso ao mesmo grupo de processos: parar a tarefa mata tudo). O anterior fica em
+     launcher.py.anterior.
 Sem a pasta `versoes\\`, usa o `primavera_sync` ao lado do launcher (instalações antigas).
 """
+import hashlib
 import json
 import os
 import subprocess
@@ -50,6 +54,13 @@ def _escrever(caminho, texto):
     os.replace(temp, caminho)
 
 
+def _hash(caminho):
+    try:
+        return hashlib.sha256(Path(caminho).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
 def _json(caminho):
     try:
         return json.loads(Path(caminho).read_text(encoding="utf-8"))
@@ -70,12 +81,14 @@ class Launcher:
         self.agora, self.lancar = agora, lancar
         self.relatar = relatar or self._relatar_lonntra
         self.log = log or self._log_ficheiro
+        self.lancar_launcher = subprocess.Popen
         self.filho = None
         self.versao_em_execucao = None
         self.arrancou_em = 0.0
         self.falhas = 0
         self.proximo_arranque = 0.0
         self.prova = _json(self.pasta / "prova.json") or None
+        self.hash_carregado = _hash(__file__)  # o launcher que está a correr (o do disco pode mudar entretanto)
 
     # ---- versões
 
@@ -214,17 +227,34 @@ class Launcher:
             _escrever(self.pasta / "estavel.txt", self.versao_em_execucao)
             self.log(f"a versão {self.versao_em_execucao} deu um ciclo bom: fica como estável")
 
+    def launcher_mudou(self):
+        """O launcher.py da pasta já não é o que está a correr (foi atualizado com uma versão do sync)."""
+        atual = _hash(self.base / "launcher.py")
+        return bool(atual) and bool(self.hash_carregado) and atual != self.hash_carregado
+
+    def passar_ao_launcher_novo(self):
+        """Pára o sync, arranca o launcher.py novo como filho (no mesmo grupo de processos) e fica à espera dele; devolve o código com
+        que ele sair. Não depende de a tarefa do Windows reiniciar um processo que sai."""
+        self.log("o launcher.py foi atualizado: passo o comando ao novo")
+        self.parar()
+        novo = self.lancar_launcher([sys.executable, str(self.base / "launcher.py"), str(self.config)], cwd=str(self.base))
+        _prender_ao_launcher(novo, self.log)
+        return novo.wait()
+
     def correr(self, dormir=time.sleep):
         self.log(f"launcher {LAUNCHER_VERSAO} a vigiar {self.config}")
         try:
             while True:
                 try:
+                    if self.launcher_mudou():
+                        return self.passar_ao_launcher_novo()
                     self.tick()
                 except Exception as e:  # noqa: BLE001 - o launcher não pode morrer por um erro seu
                     self.log(f"erro no launcher: {type(e).__name__}: {e}")
                 dormir(5)
         except KeyboardInterrupt:
             self.parar()
+        return 0
 
     # ---- registo e avisos
 
@@ -318,12 +348,12 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     base = Path(__file__).resolve().parent
     if argv and argv[0] == "--autoteste":
-        return autoteste(base, argv[1] if len(argv) > 1 else None)
+        # [config] [pasta]: a pasta é onde está a instalação (o atualizador corre o launcher NOVO, que está noutra pasta)
+        return autoteste(Path(argv[2]).resolve() if len(argv) > 2 else base, argv[1] if len(argv) > 1 else None)
     if len(argv) != 1:
         print(__doc__)
         return 2
-    Launcher(base, argv[0]).correr()
-    return 0
+    return Launcher(base, argv[0]).correr()
 
 
 if __name__ == "__main__":

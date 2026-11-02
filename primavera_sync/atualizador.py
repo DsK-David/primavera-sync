@@ -61,8 +61,8 @@ def carregar_chaves(base):
         return []
 
 
-def verificar_assinatura(versao, serie, sha256, assinatura_b64, chaves):
-    """Levanta ErroAtualizacao se nenhuma das chaves assinou este manifesto."""
+def verificar_assinatura_bytes(dados, assinatura_b64, chaves):
+    """Levanta ErroAtualizacao se nenhuma das chaves assinou estes bytes (Ed25519)."""
     try:
         from cryptography.exceptions import InvalidSignature
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -72,7 +72,6 @@ def verificar_assinatura(versao, serie, sha256, assinatura_b64, chaves):
         assinatura = base64.b64decode(assinatura_b64, validate=True)
     except (ValueError, TypeError):
         raise ErroAtualizacao("assinatura mal formada") from None
-    dados = manifesto_bytes(versao, serie, sha256)
     for chave in chaves:
         try:
             Ed25519PublicKey.from_public_bytes(base64.b64decode(chave)).verify(assinatura, dados)
@@ -80,6 +79,11 @@ def verificar_assinatura(versao, serie, sha256, assinatura_b64, chaves):
         except (InvalidSignature, ValueError):
             continue
     raise ErroAtualizacao("a assinatura não é de nenhuma chave conhecida")
+
+
+def verificar_assinatura(versao, serie, sha256, assinatura_b64, chaves):
+    """Levanta ErroAtualizacao se nenhuma das chaves assinou este manifesto de versão."""
+    verificar_assinatura_bytes(manifesto_bytes(versao, serie, sha256), assinatura_b64, chaves)
 
 
 def extrair(conteudo, destino):
@@ -171,9 +175,11 @@ class Atualizador:
                 return "ignorada"
             if (self.versoes / versao / "primavera_sync" / "__init__.py").is_file():  # já está no disco: troca local (também recua)
                 self._aplicar(versao)
+                self.atualizar_launcher(versao)
                 return "aplicada"
             self._instalar_nova(oferta, versao)
             self._aplicar(versao)
+            self.atualizar_launcher(versao)
             self.limpar_versoes()
             return "aplicada"
         except ErroAtualizacao as e:
@@ -257,6 +263,40 @@ class Atualizador:
             if r.returncode != 0:
                 saida = (r.stdout + r.stderr).strip()[-300:]
                 raise ErroAtualizacao(f"a versão nova não passou ao {descricao}: {saida}")
+
+    # ---- o próprio launcher
+
+    @staticmethod
+    def _hash(caminho):
+        try:
+            return hashlib.sha256(Path(caminho).read_bytes()).hexdigest()
+        except OSError:
+            return None
+
+    def atualizar_launcher(self, versao):
+        """Se o pacote traz um launcher.py diferente do instalado, e ele passar o --autoteste (com a versão nova como alvo), troca-o. O
+        anterior fica em launcher.py.anterior. O launcher em marcha vê que o ficheiro mudou e sai; a tarefa arranca-o outra vez. Uma
+        falha aqui nunca desfaz a atualização do sync: fica registada e o launcher antigo continua."""
+        novo, atual = self.versoes / versao / "launcher.py", self.base / "launcher.py"
+        try:
+            h = self._hash(novo)
+            if not h or not atual.is_file() or h == self._hash(atual):
+                return False
+            r = self.executar([sys.executable, str(novo), "--autoteste", self.config, str(self.base)], cwd=str(self.base),
+                              capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                raise ErroAtualizacao("o launcher novo não passou ao autoteste: " + (r.stdout + r.stderr).strip()[-250:])
+            shutil.copy2(atual, self.base / "launcher.py.anterior")
+            temp = self.base / "launcher.py.novo"
+            shutil.copyfile(novo, temp)
+            os.replace(temp, atual)
+            self.estado.limpar_erros(["atualizacao:launcher"])
+            log.info("Launcher atualizado (o anterior ficou em launcher.py.anterior); reinicia ao fim de uns segundos.")
+            return True
+        except Exception as e:  # noqa: BLE001
+            self.estado.erro("atualizacao:launcher", "launcher", str(e)[:300])
+            log.warning("Não atualizei o launcher: %s", e)
+            return False
 
     # ---- limpeza
 

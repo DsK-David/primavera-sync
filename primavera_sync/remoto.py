@@ -18,6 +18,7 @@ import io
 import json
 import logging
 import re
+import time
 from pathlib import Path
 
 log = logging.getLogger("primavera_sync")
@@ -169,10 +170,115 @@ def limpar_segredos(texto, segredos=()):
     return texto
 
 
+# ------------------------------------------------------------------------------------------ SQL assinado
+#
+# Consultas SQL à distância, para perceber a base do cliente. Ao contrário dos comandos acima, o texto da consulta NÃO vem da
+# Lonntra em quem se confie: vem ASSINADO por quem publica as versões (Ed25519, a mesma chave de chaves.json) e o sync só o corre se
+#   - a assinatura for válida (com o texto, a empresa, o id do comando e a validade dentro do que se assina);
+#   - for para ESTA empresa, ainda estiver dentro da validade (no máximo 7 dias) e o id for o do comando;
+#   - for uma só instrução SELECT/WITH, sem comentários, sem «;», sem escrita nem procedimentos (lista negra de palavras);
+# e corre no login só de leitura, com limite de linhas e de tempo. Mesmo com a Lonntra comprometida, ninguém lê a base sem a chave.
+PREFIXO_SQL = b"primavera-sync/sql/v1\n"   # separa estas assinaturas das dos pacotes (uma não serve para a outra)
+MAX_SQL = 4000
+MAX_LINHAS_SQL = 500
+VALIDADE_MAXIMA = 7 * 24 * 3600
+TEMPO_SQL = 30
+PROIBIDAS = ("insert", "update", "delete", "merge", "drop", "alter", "create", "truncate", "exec", "execute", "grant", "revoke", "deny",
+             "backup", "restore", "shutdown", "reconfigure", "openrowset", "openquery", "opendatasource", "bulk", "into", "waitfor",
+             "kill", "dbcc", "use", "declare", "set", "go", "print", "raiserror", "throw", "begin", "commit", "rollback", "checkpoint",
+             "xp_", "sp_")
+
+
+def bytes_sql(payload):
+    """O que se assina: o prefixo de domínio e o JSON canónico (igual aqui e em scripts/sql_remoto.py)."""
+    return PREFIXO_SQL + json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+
+def validar_sql(texto):
+    """Devolve o SQL limpo; levanta ValueError se não for uma só consulta de leitura."""
+    sql = str(texto or "").strip()
+    if not sql or len(sql) > MAX_SQL:
+        raise ValueError(f"a consulta tem de ter entre 1 e {MAX_SQL} caracteres")
+    # o que está entre aspas ou parênteses retos é texto/nome, não código: tira-se para procurar as palavras proibidas
+    codigo = re.sub(r"\[[^\]]*\]", "[]", re.sub(r"'(?:[^']|'')*'", "''", sql))
+    if "--" in codigo or "/*" in codigo or "*/" in codigo:
+        raise ValueError("comentários não são permitidos")
+    if codigo.rstrip().rstrip(";").count(";") or ("\x00" in sql):
+        raise ValueError("só uma instrução (sem «;» no meio)")
+    sql = sql.rstrip().rstrip(";").rstrip()
+    if not re.match(r"(?is)^\s*(select|with)\b", sql):
+        raise ValueError("só consultas que começam por SELECT ou WITH")
+    achadas = [p for p in PROIBIDAS if re.search(r"(?<![A-Za-z0-9_])" + re.escape(p) + (r"" if p.endswith("_") else r"(?![A-Za-z0-9_])"), codigo, re.IGNORECASE)]
+    if achadas:
+        raise ValueError("palavras não permitidas: " + ", ".join(achadas))
+    return sql
+
+
+def verificar_sql_assinado(cmd, empresa_id, chaves, agora=None):
+    """Confere a assinatura e as regras do pedido. Devolve o payload (dict) ou levanta ValueError com o motivo."""
+    from .atualizador import ErroAtualizacao, verificar_assinatura_bytes
+    try:
+        payload = json.loads(cmd.get("payload") or "")
+    except (TypeError, ValueError):
+        raise ValueError("pedido sem payload válido") from None
+    if not isinstance(payload, dict) or payload.get("tipo") != "sql" or payload.get("v") != 1:
+        raise ValueError("o pedido não é uma consulta SQL assinada")
+    try:
+        verificar_assinatura_bytes(bytes_sql(payload), str(cmd.get("assinatura") or ""), chaves)
+    except ErroAtualizacao as e:
+        raise ValueError(f"assinatura recusada: {e}") from None
+    agora = agora if agora is not None else time.time()
+    if str(payload.get("empresa")) != str(empresa_id):
+        raise ValueError("a consulta é para outra empresa")
+    if str(payload.get("id")) != str(cmd.get("id")):
+        raise ValueError("a assinatura é de outro comando")
+    ate = float(payload.get("ate") or 0)
+    if ate < agora:
+        raise ValueError("a consulta expirou")
+    if ate > agora + VALIDADE_MAXIMA:
+        raise ValueError("validade demasiado longa")
+    payload["sql"] = validar_sql(payload.get("sql"))
+    payload["linhas"] = max(1, min(int(payload.get("linhas") or 100), MAX_LINHAS_SQL))
+    return payload
+
+
+def _celula(v):
+    if v is None:
+        return "NULL"
+    if isinstance(v, (bytes, bytearray)):
+        return "0x" + bytes(v)[:8].hex() + ("…" if len(v) > 8 else "")
+    t = str(v).replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    return t if len(t) <= 80 else t[:79] + "…"
+
+
+def correr_sql(conn, sql, linhas):
+    """Corre a consulta já validada na ligação só de leitura e devolve um texto (cabeçalho, linhas, quantas). Só lê."""
+    cur = conn.cursor()
+    try:
+        cur.timeout = TEMPO_SQL
+    except Exception:  # noqa: BLE001 - driver sem suporte: fica o LOCK_TIMEOUT da ligação
+        pass
+    try:
+        cur.execute("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")  # não bloqueia o Primavera
+    except Exception:  # noqa: BLE001
+        pass
+    cur.execute(sql)
+    if cur.description is None:
+        raise ValueError("a consulta não devolve linhas")
+    colunas = [d[0] for d in cur.description]
+    dados = cur.fetchmany(linhas + 1)
+    mais = len(dados) > linhas
+    out = [" | ".join(colunas)]
+    out += [" | ".join(_celula(v) for v in linha) for linha in dados[:linhas]]
+    out.append(f"-- {min(len(dados), linhas)} linha(s)" + (f", cortado às {linhas}" if mais else ""))
+    return "\n".join(out)
+
+
 class Contexto:
     """O que os comandos precisam do sync em marcha."""
 
-    def __init__(self, cfg, config, estado, enviar, obter_sinc, segredos=()):
+    def __init__(self, cfg, config, estado, enviar, obter_sinc, segredos=(), empresa_id="", base=None):
+        self.empresa_id, self.base = str(empresa_id or ""), Path(base) if base else Path.cwd()
         self.cfg, self.config, self.estado = cfg, str(config), estado
         self.enviar = enviar          # envia já um sinal de vida completo (com os resultados por confirmar)
         self.obter_sinc = obter_sinc  # devolve o Sincronizador (liga ao SQL se for preciso)
@@ -216,12 +322,24 @@ def _executar(comando, args, ctx):
     raise ValueError(comando)
 
 
+def _executar_sql(cmd, ctx):
+    from .atualizador import carregar_chaves
+    chaves = carregar_chaves(ctx.base)
+    if not chaves:
+        raise ValueError("este servidor não tem chaves públicas (chaves.json): não aceita consultas SQL")
+    payload = verificar_sql_assinado(cmd, ctx.empresa_id, chaves)
+    return correr_sql(ctx.obter_sinc().fonte.conn, payload["sql"], payload["linhas"])
+
+
 def executar_comando(cmd, ctx):
     """Executa um comando da lista branca. Devolve ('ok'|'erro', texto sem segredos). Nunca levanta."""
     try:
         comando = str(cmd.get("comando", ""))
-        args = validar_comando(comando, cmd.get("args"))
-        texto = str(_executar(comando, args, ctx))
+        if comando == "sql":  # a única exceção à lista branca simples: a consulta vem assinada
+            texto = str(_executar_sql(cmd, ctx))
+        else:
+            args = validar_comando(comando, cmd.get("args"))
+            texto = str(_executar(comando, args, ctx))
         estado = "ok"
     except Exception as e:  # noqa: BLE001
         estado, texto = "erro", f"{type(e).__name__}: {e}"

@@ -1,6 +1,8 @@
 import configparser
+import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from primavera_sync import remoto
@@ -187,3 +189,184 @@ class TratarRemotoTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SqlValidarTest(unittest.TestCase):
+    def test_aceita_consultas_de_leitura(self):
+        for sql in ("SELECT TOP 5 * FROM sys.tables",
+                    "select name from sys.tables where name like 'CNO%';",
+                    "WITH x AS (SELECT 1 AS a) SELECT a FROM x",
+                    "SELECT t.name, c.name FROM sys.tables t JOIN sys.columns c ON c.object_id = t.object_id WHERE t.name = 'update'",
+                    "SELECT [Update], [Delete] FROM dbo.Tabela",
+                    "SELECT CreateDate, UpdatedBy, Setting FROM dbo.Tabela",
+                    "SELECT COUNT(*) FROM CNO_Recebimentos WHERE DataRecebimento IS NOT NULL"):
+            remoto.validar_sql(sql)
+
+    def test_tira_o_ponto_e_virgula_final(self):
+        self.assertEqual(remoto.validar_sql("SELECT 1 ; "), "SELECT 1")
+
+    def test_recusa_escrita_procedimentos_e_truques(self):
+        for sql in ("INSERT INTO t VALUES (1)", "UPDATE t SET a = 1", "DELETE FROM t", "DROP TABLE t", "TRUNCATE TABLE t", "EXEC sp_who",
+                    "SELECT * INTO nova FROM t", "SELECT 1; DROP TABLE t", "SELECT 1; SELECT 2", "SELECT 1 -- comentário",
+                    "SELECT /* x */ 1", "USE master", "DECLARE @a int", "EXEC xp_cmdshell 'dir'", "SELECT * FROM OPENROWSET('x','y','z')",
+                    "SELECT * FROM OPENQUERY(srv, 'select 1')", "WAITFOR DELAY '00:00:05'", "BACKUP DATABASE x TO DISK='y'",
+                    "SELECT sp_executesql", "BEGIN TRAN", "MERGE t USING s ON 1=1 WHEN MATCHED THEN DELETE", "  ", "", "CREATE TABLE t (a int)",
+                    "GRANT SELECT ON t TO x", "SHUTDOWN", "DBCC CHECKDB", "SELECT 1" + " " * 5000 + "FROM t"):
+            with self.assertRaises(ValueError, msg=sql[:40]):
+                remoto.validar_sql(sql)
+
+    def test_o_texto_entre_aspas_nao_engana_nem_e_apanhado(self):
+        remoto.validar_sql("SELECT 'drop table; --' AS texto")          # é texto, não código
+        with self.assertRaises(ValueError):
+            remoto.validar_sql("SELECT 'a' ; DROP TABLE t")              # o «;» está fora das aspas
+
+
+class FalsaLigacaoSql:
+    def __init__(self, linhas=(), colunas=("a", "b"), description=True):
+        self.executados, self.linhas, self.colunas, self.tem_desc = [], list(linhas), colunas, description
+
+    def cursor(self):
+        return self
+
+    @property
+    def description(self):
+        return [(c,) for c in self.colunas] if self.tem_desc else None
+
+    def execute(self, sql):
+        self.executados.append(sql)
+
+    def fetchmany(self, n):
+        return self.linhas[:n]
+
+
+class SqlCorrerTest(unittest.TestCase):
+    def test_formata_cabecalho_linhas_e_total(self):
+        conn = FalsaLigacaoSql([(1, "x"), (2, None)])
+        texto = remoto.correr_sql(conn, "SELECT a, b FROM t", 10)
+        self.assertEqual(texto.splitlines(), ["a | b", "1 | x", "2 | NULL", "-- 2 linha(s)"])
+        self.assertEqual(conn.executados[-1], "SELECT a, b FROM t")
+        self.assertIn("READ UNCOMMITTED", conn.executados[0], "não bloqueia o Primavera")
+
+    def test_corta_ao_limite_e_diz_que_cortou(self):
+        texto = remoto.correr_sql(FalsaLigacaoSql([(i, "x") for i in range(50)]), "SELECT 1", 20)
+        self.assertEqual(len(texto.splitlines()), 22)
+        self.assertIn("cortado às 20", texto)
+
+    def test_celulas_compridas_e_binarios_encurtam(self):
+        texto = remoto.correr_sql(FalsaLigacaoSql([("x" * 500, b"\x01\x02\x03" * 10)]), "SELECT 1", 5)
+        self.assertLess(len(texto.splitlines()[1]), 200)
+        self.assertIn("0x010203010203", texto)
+
+    def test_sem_resultado_da_erro(self):
+        with self.assertRaises(ValueError):
+            remoto.correr_sql(FalsaLigacaoSql(description=False), "SELECT 1", 5)
+
+
+try:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    import base64
+    TEM_CRYPTO = True
+except ImportError:
+    TEM_CRYPTO = False
+
+
+@unittest.skipUnless(TEM_CRYPTO, "precisa de «cryptography»")
+class SqlAssinadoTest(unittest.TestCase):
+    EMPRESA, ID = "006f0d7f-0ae4", "aaaaaaaa-1111"
+
+    def setUp(self):
+        self.chave = Ed25519PrivateKey.generate()
+        raw = self.chave.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        self.chaves = [base64.b64encode(raw).decode()]
+        self.agora = 1_000_000.0
+
+    def pedido(self, chave=None, bytes_fn=None, **mudar):
+        payload = {"v": 1, "tipo": "sql", "empresa": self.EMPRESA, "id": self.ID, "sql": "SELECT 1", "linhas": 50, "ate": self.agora + 3600}
+        payload.update(mudar)
+        assinatura = (chave or self.chave).sign((bytes_fn or remoto.bytes_sql)(payload))
+        return {"id": self.ID, "comando": "sql", "payload": json.dumps(payload), "assinatura": base64.b64encode(assinatura).decode()}
+
+    def verificar(self, cmd, empresa=None):
+        return remoto.verificar_sql_assinado(cmd, empresa or self.EMPRESA, self.chaves, self.agora)
+
+    def test_pedido_valido(self):
+        p = self.verificar(self.pedido())
+        self.assertEqual((p["sql"], p["linhas"]), ("SELECT 1", 50))
+
+    def test_recusas(self):
+        casos = {
+            "assinatura de outra chave": self.pedido(chave=Ed25519PrivateKey.generate()),
+            "outra empresa": self.pedido(empresa="outra"),
+            "outro comando": dict(self.pedido(), id="bbbbbbbb-2222"),
+            "expirada": self.pedido(ate=self.agora - 1),
+            "validade longa de mais": self.pedido(ate=self.agora + 30 * 24 * 3600),
+            "escrita": self.pedido(sql="DROP TABLE t"),
+        }
+        for nome, cmd in casos.items():
+            with self.assertRaises(ValueError, msg=nome):
+                self.verificar(cmd)
+
+    def test_texto_alterado_depois_de_assinado(self):
+        cmd = self.pedido()
+        payload = json.loads(cmd["payload"])
+        payload["sql"] = "SELECT * FROM Clientes"
+        cmd["payload"] = json.dumps(payload)
+        with self.assertRaises(ValueError) as cm:
+            self.verificar(cmd)
+        self.assertIn("assinatura", str(cm.exception))
+
+    def test_uma_assinatura_de_pacote_nao_serve_para_sql(self):
+        from primavera_sync.atualizador import manifesto_bytes
+        cmd = self.pedido(bytes_fn=lambda payload: json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())  # sem o prefixo de domínio
+        with self.assertRaises(ValueError):
+            self.verificar(cmd)
+
+    def test_sem_payload_ou_de_outro_tipo(self):
+        for cmd in ({"id": self.ID}, {"id": self.ID, "payload": "lixo"}, dict(self.pedido(), payload='{"tipo": "outro", "v": 1}')):
+            with self.assertRaises(ValueError):
+                self.verificar(cmd)
+
+    def test_limite_de_linhas(self):
+        self.assertEqual(self.verificar(self.pedido(linhas=99999))["linhas"], remoto.MAX_LINHAS_SQL)
+        self.assertEqual(self.verificar(self.pedido(linhas=0))["linhas"], 100)
+
+    def test_executar_comando_corre_a_consulta_assinada_e_so_essa(self):
+        conn = FalsaLigacaoSql([(7, "ok")])
+        ctx = contexto_sql(conn, self.EMPRESA, self.chaves)
+        with mock.patch("time.time", return_value=self.agora):
+            estado, texto = executar_comando(self.pedido(), ctx)
+        self.assertEqual(estado, "ok", texto)
+        self.assertIn("7 | ok", texto)
+        self.assertEqual(conn.executados[-1], "SELECT 1")
+
+    def test_pedido_mau_nunca_toca_na_base(self):
+        conn = FalsaLigacaoSql([(1, "x")])
+        ctx = contexto_sql(conn, self.EMPRESA, self.chaves)
+        with mock.patch("time.time", return_value=self.agora), self.assertLogs("primavera_sync", level="ERROR"):
+            estado, texto = executar_comando(self.pedido(chave=Ed25519PrivateKey.generate()), ctx)
+        self.assertEqual(estado, "erro")
+        self.assertIn("assinatura recusada", texto)
+        self.assertEqual(conn.executados, [])
+
+    def test_sem_chaves_no_servidor_nao_aceita_sql(self):
+        conn = FalsaLigacaoSql()
+        ctx = contexto_sql(conn, self.EMPRESA, [])
+        with self.assertLogs("primavera_sync", level="ERROR"):
+            estado, texto = executar_comando(self.pedido(), ctx)
+        self.assertEqual(estado, "erro")
+        self.assertEqual(conn.executados, [])
+
+    def test_o_comando_sql_nao_passa_pela_lista_branca_simples(self):
+        with self.assertRaises(ValueError):
+            validar_comando("sql", "SELECT 1")
+
+
+def contexto_sql(conn, empresa, chaves):
+    import json as _json
+    tmp = tempfile.mkdtemp()
+    (Path(tmp) / "chaves.json").write_text(_json.dumps({"chaves": chaves}), encoding="utf-8")
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.read(CONFIG, encoding="utf-8")
+    sinc = type("S", (), {"fonte": type("F", (), {"conn": conn})()})()
+    return Contexto(cfg, Path(tmp) / "config.ini", Estado(":memory:"), lambda: None, lambda: sinc, [], empresa, tmp)
