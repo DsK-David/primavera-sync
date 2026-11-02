@@ -384,6 +384,7 @@ def tratar_remoto(resposta, ctx):
             if mudou:
                 log.info("Configuração remota mudou: o sync reinicia para a aplicar.")
                 reiniciar = True
+        executados = 0
         comandos = resposta.get("comandos")
         for cmd in comandos if isinstance(comandos, list) else []:
             if not isinstance(cmd, dict):
@@ -396,7 +397,13 @@ def tratar_remoto(resposta, ctx):
             ctx.estado.marcar_marca(f"comando:{id_}", "1")
             estado_cmd, texto = executar_comando(cmd, ctx)
             guardar_resultado(ctx.estado, id_, estado_cmd, texto)
+            executados += 1
             log.info("Comando remoto %s: %s", cmd.get("comando"), estado_cmd)
+        if executados and not (ctx.reiniciar or reiniciar):
+            try:
+                ctx.enviar()  # os resultados seguem já, sem esperar pelo fim do ciclo (que de noite pode demorar)
+            except Exception:  # noqa: BLE001
+                log.warning("Não consegui enviar já os resultados dos comandos; seguem no próximo sinal.")
         if ctx.reiniciar or reiniciar:
             # os resultados têm de chegar antes de sair
             try:

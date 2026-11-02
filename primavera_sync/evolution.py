@@ -145,7 +145,9 @@ class Evolution:
             return RESERVA[papel]
         antes = len(self.esquema.notas)
         if papel == "recebimentos":
-            c = esquema.recebimentos(self.esquema, getattr(self, "opcoes", {}).get("tabela_recebimentos"))
+            nome = getattr(self, "opcoes", {}).get("tabela_recebimentos")
+            # primeiro as liquidações normais do Primavera; a tabela própria da empresa só se a indicou ou a base não tiver aquelas
+            c = (None if nome else esquema.recebimentos_liquidacoes(self.esquema)) or esquema.recebimentos(self.esquema, nome)
         elif papel in esquema.BUILDERS:
             c = esquema.BUILDERS[papel](self.esquema)
         else:
@@ -275,13 +277,18 @@ class Evolution:
     @property
     def recebimentos_prontos(self):
         """True se a empresa escreveu a sua própria consulta, que já devolve (Id, IdCabecDoc, Data, Valor, ModoPag, Numero)."""
-        return "recebimentos" in self.manuais
+        if "recebimentos" in self.manuais:
+            return True
+        try:
+            return self.consulta("recebimentos").extra.get("modo") == "prontos"  # as liquidações do Primavera também vêm prontas
+        except ErroEsquema:
+            return False
 
     def recebimentos(self, desde=None):
         """Os movimentos recebidos desde essa data (pela data do recebimento), em bruto; ou, se a empresa tem a sua consulta em
         [consultas] recebimentos, os recebimentos já prontos."""
         def preparar(c):
-            if self.recebimentos_prontos:
+            if "recebimentos" in self.manuais:
                 return c.sql, ([desde or date(1900, 1, 1)] if "?" in c.sql else [])
             filtro, params = (c.extra.get("filtro_data", ""), [desde]) if desde else ("", [])
             return c.sql.format(filtro_data=filtro), params

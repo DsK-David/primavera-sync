@@ -31,9 +31,18 @@ SERVIDOR = "lonntra"
 APP = "/var/www/lonntra"
 
 
-def ssh(comando, tempo=120):
-    r = subprocess.run(["ssh", "-o", "ConnectTimeout=15", SERVIDOR, comando], capture_output=True, text=True, timeout=tempo)
-    return r.returncode, (r.stdout + r.stderr).strip()
+def ssh(comando, tempo=60, tentativas=3):
+    """Corre um comando na Lonntra. A ligação às vezes demora: repete em vez de rebentar."""
+    ultimo = ""
+    for _ in range(tentativas):
+        try:
+            r = subprocess.run(["ssh", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=4", SERVIDOR, comando],
+                               capture_output=True, text=True, timeout=tempo)
+            return r.returncode, (r.stdout + r.stderr).strip()
+        except subprocess.TimeoutExpired:
+            ultimo = "a ligação à Lonntra demorou de mais"
+            time.sleep(3)
+    return 255, ultimo
 
 
 def main():

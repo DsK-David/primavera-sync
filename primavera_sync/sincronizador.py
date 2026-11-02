@@ -221,8 +221,14 @@ class Sincronizador:
         self.modos = {k.upper(): v.strip() for k, v in cfg["modos_pagamento"].items()} if cfg.has_section("modos_pagamento") else {}
         self.erro_catalogo = None
         self.erro_recebimentos = None
+        self.pulso = None  # função chamada entre lotes, para dar sinal e tratar comandos dentro de um ciclo longo (ver main)
         self.codigos_servico = set()  # artigos que são serviços (sem stock): preenchido ao enviar o catálogo
         self._servicos_limpos = False
+
+    def _pulsar(self):
+        """Dentro de um ciclo longo (a carga do histórico demora horas) continua a dar sinal e a tratar os comandos remotos."""
+        if self.pulso:
+            self.pulso()
 
     @staticmethod
     def _marca(valor):
@@ -258,9 +264,17 @@ class Sincronizador:
         vêm prontas; senão casam-se com as faturas enviadas e infere-se o valor."""
         linhas = self.fonte.recebimentos(desde)
         if getattr(self.fonte, "recebimentos_prontos", False):
-            return None, [{"id": str(r["Id"]), "documento_id": str(r["IdCabecDoc"]).upper(), "data": receb._data(r["Data"]),
-                           "valor": round(abs(_num(r["Valor"])), 2), "numero": _txt(r.get("Numero")) or None,
-                           "metodo_pagamento": self.modos.get(_txt(r.get("ModoPag")).upper())} for r in linhas if _num(r.get("Valor"))]
+            # as linhas já vêm prontas (liquidações do Primavera, ou a consulta da empresa): só interessam as de faturas já enviadas
+            ja_enviados = self.estado.enviados()
+            # as faturas-recibo e as vendas a dinheiro entram pagas na Lonntra (o recibo é automático): não se enviam os dela
+            pagas_no_ato = {doc for doc, numero in self.estado.conn.execute("SELECT documento, numero FROM enviados")
+                            if self.tipos.get(str(numero).split(" ")[0].upper()) in ("FR", "TV")}
+            itens = [{"id": str(r["Id"]).upper(), "documento_id": str(r["IdCabecDoc"]).upper(), "data": receb._data(r["Data"]),
+                      "valor": round(abs(_num(r["Valor"])), 2), "numero": _txt(r.get("Numero")) or None,
+                      "metodo_pagamento": self.modos.get(_txt(r.get("ModoPag")).upper())}
+                     for r in linhas if _num(r.get("Valor")) and str(r["IdCabecDoc"]).upper() in ja_enviados
+                     and str(r["IdCabecDoc"]).upper() not in {d.upper() for d in pagas_no_ato}]
+            return {"prontos": True, "lidas": len(linhas), "de_faturas_enviadas": len(itens), "exemplos": itens[:5]}, itens
         enviados = list(self.estado.conn.execute("SELECT documento, numero FROM enviados"))
         analise = receb.analisar(linhas, enviados, self.fonte.totais, self.s.get("moeda", "CVE"),
                                  self.cfg["recebimentos"].get("formula") if self.cfg.has_section("recebimentos") else None)
@@ -269,8 +283,15 @@ class Sincronizador:
     def relatorio_recebimentos(self):
         """O relatório (sem enviar nada): como os movimentos casam com as faturas e que fórmula do valor bate com os totais."""
         analise, itens = self._recebimentos_lidos(None)
-        if analise is None:
-            return f"Consulta própria da empresa: {len(itens)} recebimentos prontos a enviar."
+        if analise and analise.get("prontos"):
+            total = round(sum(i["valor"] for i in itens), 2)
+            texto = [f"Recebimentos lidos do Primavera: {analise['lidas']}",
+                     f"De faturas já enviadas à Lonntra (os que seguem): {analise['de_faturas_enviadas']}, no valor de {total:.2f}"]
+            if analise["exemplos"]:
+                texto.append("Exemplos (recibo, data, valor):")
+                texto += [f"    {i['numero']}  {i['data']}  {i['valor']:.2f}" for i in analise["exemplos"]]
+            texto.append("PRONTO PARA ENVIAR (ligar com recebimentos = sim em [sincronizacao])" if itens else "NADA PARA ENVIAR")
+            return "\n".join(texto)
         texto = receb.formatar(analise) + f"\nRecebimentos que seguiam (um por fatura e data): {len(itens)}"
         if analise["movimentos"] == 0 and hasattr(self.fonte, "diagnostico_recebimentos"):
             texto += "\n\nPorque não leu nada?\n" + self.fonte.diagnostico_recebimentos()
@@ -280,7 +301,7 @@ class Sincronizador:
         """Envia os recebimentos novos ou que mudaram. Só envia se o relatório for fiável (ver recebimentos.py)."""
         desde, carga = self._historico("recebimentos", completo)
         analise, itens = self._recebimentos_lidos(desde)
-        if analise is not None and not analise["fiavel"]:
+        if analise is not None and not analise.get("prontos") and not analise["fiavel"]:
             self.estado.erro("recebimentos:analise", "recebimentos", analise["motivo"])
             log.warning("Recebimentos não enviados: %s", analise["motivo"])
             return 0
@@ -289,6 +310,7 @@ class Sincronizador:
         novos = [i for i in itens if feitos.get(i["id"]) != f"{i['valor']:.2f}" and recusados.get(i["id"]) != self._marca(f"{i['valor']:.2f}")]
         enviados = 0
         for parte in _partes(novos):
+            self._pulsar()
             erros = self._erros("recebimento", self.lonntra.recebimentos(parte))
             aceites = {i["id"]: f"{i['valor']:.2f}" for i in parte if i["id"] not in erros}
             self.estado.guardar_catalogo("recebimento", aceites)
@@ -375,6 +397,7 @@ class Sincronizador:
         self.codigos_servico = codigos_servico
         enviados = 0
         for parte in _partes(list(novos.values())[:limite]):
+            self._pulsar()
             r = self.lonntra.artigos([i for i, _ in parte])
             erros = self._erros("artigo", r)
             aceites = {i["codigo"]: h for i, h in parte if i["codigo"] not in erros}
@@ -414,6 +437,7 @@ class Sincronizador:
         if limite:  # os mais recentes
             movimentos = sorted(movimentos, key=lambda m: m["data"] or "")[-limite:]
         for parte in _partes(movimentos):
+            self._pulsar()
             erros = self._erros("movimento", self.lonntra.stock(movimentos=parte))
             self.estado.guardar_catalogo("movimento", {m["id"]: "" for m in parte if m["id"] not in erros})
             self.estado.guardar_recusas("movimento", {m["id"]: self._marca("") for m in parte if m["id"] in erros})
@@ -439,6 +463,7 @@ class Sincronizador:
         lista = [{"artigo": k.split("|")[0], "armazem": k.split("|")[1], "quantidade": float(v)} for k, v in existencias.items()]
         lista = lista[:limite]
         for parte in _partes(lista):
+            self._pulsar()
             erros = self._erros("existencia", self.lonntra.stock(existencias=parte))
             chaves = {f"{e['artigo']}|{e['armazem']}": f"{e['artigo']}@{e['armazem']}" for e in parte}
             ok = {c: existencias[c] for c, recusa in chaves.items() if recusa not in erros}
@@ -499,6 +524,7 @@ class Sincronizador:
         enviados = erros = 0
         numeros = []
         for d in docs:
+            self._pulsar()
             numero = f"{d['TipoDoc']} {d['Serie']}/{d['NumDoc']}"
             try:
                 corpo = self.corpo(d, linhas.get(d["Id"], []), clientes, artigos, servicos)
@@ -827,6 +853,21 @@ def main(argv=None):
             sinc = Sincronizador(Evolution.ligar(cfg["primavera"]["ligacao"], consultas, opcoes_de(cfg)), lonntra, estado, cfg)
         return sinc
 
+    ultimo_sinal = [time.time()]
+
+    def pulsar():
+        """Chamado entre lotes: se passou um minuto desde o último sinal, dá sinal, trata os comandos remotos e as atualizações."""
+        if time.time() - ultimo_sinal[0] < 60:
+            return
+        ultimo_sinal[0] = time.time()
+        resposta = enviar_sinal()
+        codigo = remoto.tratar_remoto(resposta, ctx)
+        atualizar(resposta, a.config, lonntra, estado)
+        escrever_saude(Path(a.config).resolve().parent, None, ciclo_ok=False)  # está vivo (o ciclo bom regista-se no fim)
+        if codigo:
+            log.info("A reiniciar (%d) a meio do ciclo, para aplicar a configuração ou o comando remoto.", codigo)
+            sys.exit(codigo)
+
     segredos = [cfg["lonntra"].get("chave", "")] + re.findall(r"(?i)PWD=\{?([^;}]+)", cfg["primavera"].get("ligacao", ""))
     empresa_id = cfg["lonntra"].get("chave", "").split(".")[0]  # a chave é «<empresa>.<segredo>»
     ctx = remoto.Contexto(cfg, a.config, estado, enviar_sinal, obter_sinc, segredos, empresa_id, Path.cwd())
@@ -835,6 +876,7 @@ def main(argv=None):
         try:
             if sinc is None:  # a primeira vez, e depois de a ligação ao SQL Server cair
                 sinc = Sincronizador(Evolution.ligar(cfg["primavera"]["ligacao"], consultas, opcoes_de(cfg)), lonntra, estado, cfg)
+            sinc.pulso = pulsar
             sinc.ciclo(completo=completo)
             completo = False
         except ErroLigacao as e:
@@ -845,6 +887,7 @@ def main(argv=None):
             log.exception("Erro no ciclo; volto a ligar ao SQL Server e tento outra vez daqui a %ds.", intervalo)
             sinc = None
         erros_ciclo["ciclo"], erros_ciclo["catalogo"] = erro_ciclo, ((sinc.erro_catalogo or sinc.erro_recebimentos) if sinc else None)
+        ultimo_sinal[0] = time.time()
         resposta = enviar_sinal()
         reiniciar = remoto.tratar_remoto(resposta, ctx)  # configuração e comandos da Lonntra (lista branca)
         completo, ctx.completo = completo or ctx.completo, False

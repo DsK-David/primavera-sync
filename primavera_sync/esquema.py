@@ -317,6 +317,39 @@ def recebimentos(e, nome_tabela=None):
                           "mapa": {papel: real for papel, real in m.items() if real}})
 
 
+def recebimentos_liquidacoes(e):
+    """Os recebimentos pelas tabelas NORMAIS do Primavera: cada linha de uma liquidação (recibo) que liquida uma fatura de cliente.
+    CabLiq é o cabeçalho do recibo (data, método, anulado) e LinhasLiq liga-o à fatura de origem (tipo, série e número). Dá
+    as colunas já prontas (Id, IdCabecDoc, Data, Valor, ModoPag, Numero) e, ao contrário da tabela própria da empresa, não precisa
+    de adivinhar nada. Devolve None se a base não tiver estas tabelas."""
+    linhas, cab, doc = e.tabela(["LinhasLiq"]), e.tabela(["CabLiq"]), e.tabela(["CabecDoc"])
+    if not (linhas and cab and doc):
+        return None
+    col = lambda t, *cands: e.coluna(t, list(cands), aproximar=False)  # noqa: E731
+    l_id, l_cab, l_tipo, l_serie = col(linhas, "Id"), col(linhas, "IdCabLiq"), col(linhas, "TipoDocOrig"), col(linhas, "SerieOrig")
+    l_num, l_valor = col(linhas, "NumDocOrigInt", "NumDocOrig"), col(linhas, "ValorRec")
+    l_ent, l_te, l_desc = col(linhas, "Entidade"), col(linhas, "TipoEntidade"), col(linhas, "ValorDesconto")
+    c_id, c_tipo, c_serie, c_num = col(cab, "Id"), col(cab, "TipoDoc"), col(cab, "Serie"), col(cab, "NumDoc")
+    c_data, c_modo, c_anul = col(cab, "DataDoc", "Data"), col(cab, "ModoPag"), col(cab, "Anulado")
+    d_id, d_tipo, d_serie, d_num, d_ent = col(doc, "Id"), col(doc, "TipoDoc"), col(doc, "Serie"), col(doc, "NumDoc"), col(doc, "Entidade")
+    if not all([l_id, l_cab, l_tipo, l_serie, l_num, l_valor, c_id, c_tipo, c_num, c_data, d_id, d_tipo, d_serie, d_num]):
+        return None
+    valor = f"l.[{l_valor}]" + (f" + COALESCE(l.[{l_desc}], 0)" if l_desc else "")  # o desconto de pronto pagamento também liquida
+    numero = f"CONCAT(c.[{c_tipo}], ' ', " + (f"c.[{c_serie}], '/', " if c_serie else "") + f"c.[{c_num}])"
+    onde = [f"l.[{l_valor}] > 0"]
+    if c_anul:
+        onde.append(f"COALESCE(c.[{c_anul}], 0) = 0")
+    if l_te:
+        onde.append(f"l.[{l_te}] = 'C'")
+    juncao = (f"d.[{d_tipo}] = l.[{l_tipo}] AND d.[{d_serie}] = l.[{l_serie}] AND d.[{d_num}] = l.[{l_num}]"
+              + (f" AND d.[{d_ent}] = l.[{l_ent}]" if d_ent and l_ent else ""))
+    sql = (f"SELECT l.[{l_id}] AS [Id], d.[{d_id}] AS [IdCabecDoc], c.[{c_data}] AS [Data], {valor} AS [Valor], "
+           + (f"c.[{c_modo}]" if c_modo else "CAST(NULL AS varchar(10))") + f" AS [ModoPag], {numero} AS [Numero] "
+           f"FROM [{linhas.esquema}].[{linhas.nome}] l JOIN [{cab.esquema}].[{cab.nome}] c ON c.[{c_id}] = l.[{l_cab}] "
+           f"JOIN [{doc.esquema}].[{doc.nome}] d ON {juncao} WHERE {' AND '.join(onde)} {{filtro_data}} ORDER BY c.[{c_data}]")
+    e.notas.append("recebimentos: pelas liquidações do Primavera (LinhasLiq + CabLiq)")
+    return Consulta(sql, {"filtro_data": f"AND c.[{c_data}] >= ?", "modo": "prontos", "tabela": linhas.nome})
+
 BUILDERS = {
     "documentos": documentos,
     "linhas": linhas,

@@ -330,3 +330,115 @@ class SemRuidoEDiagnosticoTest(unittest.TestCase):
         self.assertIn("Tabela dos recebimentos: X", texto)
         estado.conn.close()
         tmp.cleanup()
+
+
+class LiquidacoesDoPrimaveraTest(unittest.TestCase):
+    """Os recebimentos pelas tabelas normais do Primavera: LinhasLiq liga cada recibo (CabLiq) à fatura de origem."""
+    LINHAS = ["TipoEntidade", "Entidade", "TipoDoc", "NumDoc", "DataDoc", "ValorOrig", "ValorRec", "ValorPend", "ValorDesconto", "TipoDocOrig",
+              "NumDocOrig", "NumDocOrigInt", "Serie", "SerieOrig", "Id", "IdCabLiq"]
+    CAB = ["TipoEntidade", "Entidade", "TipoDoc", "NumDoc", "DataDoc", "ValorRec", "ModoPag", "Moeda", "Serie", "Id", "Anulado"]
+    DOC = ["Id", "TipoDoc", "Serie", "NumDoc", "Entidade", "TipoEntidade", "Data", "TotalDocumento"]
+
+    def esquema(self, **mudar):
+        tabelas = {"LinhasLiq": self.LINHAS, "CabLiq": self.CAB, "CabecDoc": self.DOC}
+        tabelas.update(mudar)
+        return Esquema([Tabela("dbo", n, c, 10) for n, c in tabelas.items() if c is not None])
+
+    def test_monta_a_consulta_pronta_pelas_tres_tabelas(self):
+        c = esquema.recebimentos_liquidacoes(self.esquema())
+        for parte in ("l.[Id] AS [Id]", "d.[Id] AS [IdCabecDoc]", "c.[DataDoc] AS [Data]", "AS [ModoPag]", "AS [Numero]", "CONCAT(c.[TipoDoc], ' ', c.[Serie], '/', c.[NumDoc])",
+                      "JOIN [dbo].[CabLiq] c ON c.[Id] = l.[IdCabLiq]", "d.[TipoDoc] = l.[TipoDocOrig]", "d.[Serie] = l.[SerieOrig]", "d.[NumDoc] = l.[NumDocOrigInt]",
+                      "d.[Entidade] = l.[Entidade]", "COALESCE(c.[Anulado], 0) = 0", "l.[TipoEntidade] = 'C'", "l.[ValorRec] > 0", "{filtro_data}"):
+            self.assertIn(parte, c.sql)
+        self.assertEqual(c.extra["modo"], "prontos")
+        self.assertEqual(c.extra["filtro_data"], "AND c.[DataDoc] >= ?")
+
+    def test_o_desconto_de_pronto_pagamento_conta_como_recebido(self):
+        self.assertIn("l.[ValorRec] + COALESCE(l.[ValorDesconto], 0) AS [Valor]", esquema.recebimentos_liquidacoes(self.esquema()).sql)
+        sem = [c for c in self.LINHAS if c != "ValorDesconto"]
+        self.assertIn("l.[ValorRec] AS [Valor]", esquema.recebimentos_liquidacoes(self.esquema(LinhasLiq=sem)).sql)
+
+    def test_sem_as_tabelas_ou_colunas_essenciais_devolve_none(self):
+        self.assertIsNone(esquema.recebimentos_liquidacoes(self.esquema(LinhasLiq=None)))
+        self.assertIsNone(esquema.recebimentos_liquidacoes(self.esquema(CabLiq=None)))
+        self.assertIsNone(esquema.recebimentos_liquidacoes(self.esquema(LinhasLiq=[c for c in self.LINHAS if c != "IdCabLiq"])))
+
+    def test_o_evolution_prefere_as_liquidacoes_e_so_usa_a_tabela_propria_se_a_empresa_a_indicar(self):
+        from primavera_sync.evolution import Evolution
+        cno = ["NumeroDoc", "Recebido", "DataRecebimento", "ValorLiquido", "IDMovimento"]
+        ev = Evolution.__new__(Evolution)
+        ev.conn, ev.manuais, ev.notas, ev._cache, ev.opcoes = None, {}, [], {}, {}
+        ev.esquema = self.esquema(CNO_Recebimentos=cno)
+        self.assertEqual(ev.consulta("recebimentos").extra["modo"], "prontos")
+        self.assertTrue(ev.recebimentos_prontos)
+        ev._cache = {}
+        ev.opcoes = {"tabela_recebimentos": "CNO_Recebimentos"}
+        c = ev.consulta("recebimentos")
+        self.assertEqual(c.extra["tabela"], "CNO_Recebimentos")
+        self.assertFalse(ev.recebimentos_prontos, "a tabela própria precisa de casar e conferir")
+
+    def test_sem_liquidacoes_cai_na_tabela_propria(self):
+        from primavera_sync.evolution import Evolution
+        ev = Evolution.__new__(Evolution)
+        ev.conn, ev.manuais, ev.notas, ev._cache, ev.opcoes = None, {}, [], {}, {}
+        ev.esquema = Esquema([Tabela("dbo", "CNO_Recebimentos", ["NumeroDoc", "Recebido", "DataRecebimento", "ValorLiquido"], 10)])
+        self.assertEqual(ev.consulta("recebimentos").extra["tabela"], "CNO_Recebimentos")
+
+
+class SincronizadorLiquidacoesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.fonte, self.api = FontePrimavera(), LonntraFalsa()
+        self.fonte.recebimentos_prontos = True
+        self.estado = Estado(str(Path(self.tmp.name) / "estado.db"))
+        self.estado.marcar("D1", "FA 2026/12", "lt-1")
+        hoje = date.today()
+        self.fonte.recebimentos_ = [
+            {"Id": "l1", "IdCabecDoc": "d1", "Data": hoje, "Valor": 1150.0, "ModoPag": "NUM", "Numero": "RE 2026/3"},
+            {"Id": "l2", "IdCabecDoc": "d1", "Data": hoje, "Valor": 100.0, "ModoPag": None, "Numero": "RE 2026/4"},
+            {"Id": "l3", "IdCabecDoc": "DX", "Data": hoje, "Valor": 50.0, "ModoPag": "NUM", "Numero": "RE 2026/5"},   # fatura que nunca foi enviada
+            {"Id": "l4", "IdCabecDoc": "d1", "Data": hoje, "Valor": 0, "ModoPag": "NUM", "Numero": "RE 2026/6"},      # sem valor
+        ]
+        self.sinc = Sincronizador(self.fonte, self.api, self.estado, cfg_com())
+
+    def tearDown(self):
+        self.estado.conn.close()
+        self.tmp.cleanup()
+
+    def test_so_envia_os_de_faturas_ja_enviadas_e_com_valor(self):
+        self.sinc.ciclo()
+        enviados = [i for p in self.api.pedidos_recebimentos for i in p]
+        self.assertEqual(sorted(i["id"] for i in enviados), ["L1", "L2"])
+        self.assertEqual({i["documento_id"] for i in enviados}, {"D1"})
+        self.assertEqual({i["numero"] for i in enviados}, {"RE 2026/3", "RE 2026/4"})
+
+    def test_faturas_recibo_e_vendas_a_dinheiro_nao_enviam_o_recibo_automatico(self):
+        self.estado.marcar("D2", "FR 2026/7", "lt-2")   # FR e VD entram pagas na Lonntra
+        self.estado.marcar("D3", "VD 2026/9", "lt-3")
+        hoje = date.today()
+        self.fonte.recebimentos_ += [{"Id": "l5", "IdCabecDoc": "d2", "Data": hoje, "Valor": 500.0, "ModoPag": "NUM", "Numero": "VDR 2026/1"},
+                                     {"Id": "l6", "IdCabecDoc": "d3", "Data": hoje, "Valor": 300.0, "ModoPag": "NUM", "Numero": "VDR 2026/2"}]
+        self.sinc.ciclo()
+        enviados = {i["id"] for p in self.api.pedidos_recebimentos for i in p}
+        self.assertEqual(enviados, {"L1", "L2"}, "só os da fatura a crédito")
+
+    def test_cada_linha_de_recibo_tem_o_seu_id_estavel(self):
+        self.sinc.ciclo()
+        n = sum(len(p) for p in self.api.pedidos_recebimentos)
+        self.sinc.ciclo()
+        self.assertEqual(sum(len(p) for p in self.api.pedidos_recebimentos), n, "iguais: não reenvia")
+
+    def test_o_relatorio_diz_quantos_seguem_e_o_valor(self):
+        texto = self.sinc.relatorio_recebimentos()
+        self.assertIn("lidos do Primavera: 4", texto)
+        self.assertIn("faturas já enviadas à Lonntra (os que seguem): 2", texto)
+        self.assertIn("1250.00", texto)
+        self.assertIn("RE 2026/3", texto)
+        self.assertIn("PRONTO PARA ENVIAR", texto)
+        self.assertEqual(self.api.pedidos_recebimentos, [])
+
+    def test_o_pulso_entre_lotes_e_chamado(self):
+        chamadas = []
+        self.sinc.pulso = lambda: chamadas.append(1)
+        self.sinc.ciclo()
+        self.assertGreaterEqual(len(chamadas), 1, "dá sinal também dentro de um ciclo longo")
