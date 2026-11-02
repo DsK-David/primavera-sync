@@ -488,3 +488,28 @@ class RobustezTest(unittest.TestCase):
         self.estado.copia_diaria(manter=7)
         self.assertLessEqual(len(list(Path(self.tmp.name).glob("estado.db.*.bak"))), 7)
 
+
+class SaudeTest(unittest.TestCase):
+    def test_saude_regista_o_ciclo_bom_e_mantem_o_ultimo_bom_quando_falha(self):
+        import json
+        from primavera_sync.sincronizador import escrever_saude
+        with tempfile.TemporaryDirectory() as tmp:
+            escrever_saude(tmp, None, ciclo_ok=True, agora=100.0)
+            s = json.loads((Path(tmp) / "saude.json").read_text(encoding="utf-8"))
+            self.assertEqual((s["ciclo_ok_em"], s["ultimo_erro"]), (100.0, None))
+            escrever_saude(tmp, "Lonntra: 500", ciclo_ok=False, agora=200.0)
+            s = json.loads((Path(tmp) / "saude.json").read_text(encoding="utf-8"))
+            self.assertEqual((s["ciclo_ok_em"], s["ciclo_em"], s["ultimo_erro"]), (100.0, 200.0, "Lonntra: 500"))
+
+    def test_saude_nao_herda_o_ciclo_bom_de_outra_versao(self):
+        import json
+        from primavera_sync.sincronizador import escrever_saude
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "saude.json").write_text(json.dumps({"versao": "0.0.1", "ciclo_ok_em": 999.0}), encoding="utf-8")
+            escrever_saude(tmp, "erro", ciclo_ok=False, agora=5.0)
+            self.assertIsNone(json.loads((Path(tmp) / "saude.json").read_text(encoding="utf-8"))["ciclo_ok_em"])
+
+    def test_saude_numa_pasta_que_nao_existe_nao_derruba(self):
+        from primavera_sync.sincronizador import escrever_saude
+        with self.assertLogs("primavera_sync", level="WARNING"):
+            escrever_saude("/nao/existe/mesmo", None)

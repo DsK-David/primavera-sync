@@ -411,3 +411,15 @@ O sync não depende de nomes fixos de tabelas e colunas: ao arrancar, lê a estr
 - Uma consulta escrita à mão em `[consultas]` do `config.ini` tem sempre prioridade.
 
 Para ver o que o sync percebeu: `python -m primavera_sync.sincronizador config.ini --esquema` mostra a consulta de cada parte, ou o que falta e porquê. O `--verificar` lista também o que ficou vazio ou foi assumido.
+
+## O launcher e as versões (a base da atualização à distância)
+
+A tarefa do Windows já não corre o sync diretamente: corre o `launcher.py`, que arranca o sync como processo filho na versão indicada em `empresas\<empresa>\atual.txt` (o pacote fica em `versoes\<versão>\primavera_sync`). Serve para:
+
+- **recuar nos reinícios:** se o sync morre, o launcher espera 10 s, 30 s, 1 min, 5 min… (antes a tarefa reiniciava de minuto a minuto);
+- **reverter versões que falham:** uma versão nova tem 10 minutos para dar um ciclo bom (`saude.json`); se não der, ou morrer 3 vezes, volta à anterior (`estavel.txt`), marca a nova com um ficheiro `FALHOU` e avisa a Lonntra, mesmo que a nova nem arranque;
+- **não deixar processos órfãos:** no Windows o sync fica preso ao launcher (Job Object), por isso parar a tarefa pára os dois.
+
+Ficheiros por empresa: `atual.txt` (a que deve correr), `estavel.txt` (a última que deu ciclos bons), `anterior.txt`, `saude.json`, `prova.json` (uma versão em prova), `launcher.log`. O `estado.bat` mostra-os.
+
+`python launcher.py --autoteste empresas\<empresa>\config.ini` verifica que o launcher consegue arrancar o sync (o instalador corre-o). Sem a pasta `versoes\`, o launcher usa o `primavera_sync` ao lado dele (instalações antigas).

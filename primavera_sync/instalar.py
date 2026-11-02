@@ -11,6 +11,7 @@ import getpass
 import json
 import re
 import secrets
+import shutil
 import socket
 import sys
 from dataclasses import dataclass
@@ -137,6 +138,24 @@ def senha_existente(pasta=None):
         if m:
             return m.group(1)
     return None
+
+
+def instalar_versao(pasta_empresa):
+    """Põe o pacote em versoes/<versão>/ (as versões ficam lado a lado) e aponta a empresa para ela. O launcher arranca
+    sempre a versão do atual.txt; a anterior fica em anterior.txt e a última que deu ciclos bons em estavel.txt."""
+    destino = PASTA / "versoes" / __version__ / "primavera_sync"
+    shutil.copytree(PASTA / "primavera_sync", destino, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    falhou = PASTA / "versoes" / __version__ / "FALHOU"
+    if falhou.exists():  # uma instalação à mão é uma decisão: a versão volta a poder correr
+        falhou.unlink()
+    pasta_empresa = Path(pasta_empresa)
+    pasta_empresa.mkdir(parents=True, exist_ok=True)
+    atual = pasta_empresa / "atual.txt"
+    antes = atual.read_text(encoding="utf-8").strip() if atual.exists() else ""
+    if antes and antes != __version__:
+        (pasta_empresa / "anterior.txt").write_text(antes, encoding="utf-8")
+    atual.write_text(__version__, encoding="utf-8")
+    return __version__
 
 
 def parece_id(texto):
@@ -648,6 +667,7 @@ def main():
             if este and quero_teste:
                 este = passo_teste(e, config)
             bem = bem and este
+            instalar_versao(e.pasta)
             rel = e.pasta.relative_to(PASTA)
             manifesto.append({"nome": e.nome, "tarefa": e.tarefa, "config": str(rel / "config.ini"),
                               "log": str(rel / "primavera-sync.log")})

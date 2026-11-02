@@ -23,6 +23,7 @@ import sqlite3
 import sys
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 from . import __version__
 from .lonntra import ErroApi, ErroLigacao, Lonntra
@@ -535,6 +536,25 @@ def ler_config(caminho):
     return cfg
 
 
+def escrever_saude(pasta, erro=None, ciclo_ok=True, agora=None):
+    """saude.json na pasta da empresa: o launcher vê aqui se uma versão nova dá ciclos bons. Nunca pára o sync."""
+    try:
+        agora = agora if agora is not None else time.time()
+        ficheiro = Path(pasta) / "saude.json"
+        antes = {}
+        try:
+            antes = json.loads(ficheiro.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        saude = {"versao": __version__, "pid": os.getpid(), "ciclo_em": agora, "ultimo_erro": erro,
+                 "ciclo_ok_em": agora if ciclo_ok else (antes.get("ciclo_ok_em") if antes.get("versao") == __version__ else None)}
+        temp = ficheiro.with_name("saude.json.tmp")
+        temp.write_text(json.dumps(saude), encoding="utf-8")
+        os.replace(temp, ficheiro)
+    except Exception:  # noqa: BLE001
+        log.warning("Não consegui escrever o saude.json.", exc_info=True)
+
+
 def dar_sinal(lonntra, estado, erro_ciclo=None, erro_catalogo=None):
     """O sinal de vida nunca derruba o sync: qualquer falha (a Lonntra em baixo, uma recusa 422…) fica só no log."""
     try:
@@ -716,6 +736,7 @@ def main(argv=None):
             log.exception("Erro no ciclo; volto a ligar ao SQL Server e tento outra vez daqui a %ds.", intervalo)
             sinc = None
         dar_sinal(lonntra, estado, erro_ciclo, sinc.erro_catalogo if sinc else None)
+        escrever_saude(Path(a.config).resolve().parent, erro_ciclo, ciclo_ok=erro_ciclo is None)
         estado.copia_diaria()
         if a.uma_vez:
             return

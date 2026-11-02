@@ -4,7 +4,7 @@
 #  2. instala o Python 3.12 (se faltar) e o pyodbc
 #  3. corre o assistente (python -m primavera_sync.instalar): descobre o Primavera, cria o login de leitura,
 #     propõe os mapas, escreve o config.ini e verifica tudo
-#  4. cria uma tarefa por empresa («PrimaveraLonntra» para a instalação antiga, «PrimaveraLonntra-<empresa>» para as
+#  4. cria uma tarefa por empresa, que corre o launcher.py (arranca o sync em versoes\<versão>) («PrimaveraLonntra» para a instalação antiga, «PrimaveraLonntra-<empresa>» para as
 #     outras; arrancam com o Windows, como SYSTEM, e reiniciam se pararem) e arranca-as
 #  5. espera pelo primeiro ciclo de cada uma e mostra o resultado; tudo fica em relatorio-instalacao.txt
 param([string]$Destino = "C:\primavera-sync")
@@ -31,7 +31,7 @@ Titulo "Ficheiros"
 New-Item -ItemType Directory -Force -Path $Destino, "$Destino\logs" | Out-Null
 if ((Resolve-Path $Origem).Path -ne (Resolve-Path $Destino).Path) {
     Copy-Item -Recurse -Force "$Origem\primavera_sync" $Destino
-    foreach ($f in "config.example.ini", "instalar.bat", "instalar.ps1", "estado.bat", "estado.ps1", "desinstalar.bat", "cliente.ini") {
+    foreach ($f in "config.example.ini", "instalar.bat", "instalar.ps1", "launcher.py", "estado.bat", "estado.ps1", "desinstalar.bat", "desinstalar.ps1", "cliente.ini") {
         if (Test-Path "$Origem\$f") { Copy-Item -Force "$Origem\$f" $Destino }
     }
 }
@@ -76,6 +76,10 @@ Ok ("drivers ODBC: " + ($drivers -join ", "))
 $antes = Get-ScheduledTask -TaskName "$Prefixo*" -ErrorAction SilentlyContinue
 $aCorrer = @($antes | Where-Object { $_.State -eq "Running" } | ForEach-Object { $_.TaskName })
 if ($antes) { $antes | Stop-ScheduledTask -ErrorAction SilentlyContinue; Aviso "as tarefas que já existiam foram paradas para reconfigurar" }
+# parar uma tarefa pode deixar o sync órfão a correr (instalações sem launcher): terminam-se, para não ficarem dois
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -match "primavera_sync|launcher\.py" -and $_.CommandLine -notmatch "primavera_sync\.instalar" } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Remove-Item "$Destino\instalacao.json" -ErrorAction SilentlyContinue
 Push-Location $Destino
 & $Py -m primavera_sync.instalar
@@ -99,7 +103,10 @@ $definicoes = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (N
     -MultipleInstances IgnoreNew
 $quem = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 foreach ($e in $empresas) {
-    $acao = New-ScheduledTaskAction -Execute $Py -Argument "-m primavera_sync.sincronizador `"$($e.config)`"" -WorkingDirectory $Destino
+    # a tarefa corre o launcher, que arranca o sync na versão certa, recua nos reinícios e reverte versões que falham
+    $acao = New-ScheduledTaskAction -Execute $Py -Argument "launcher.py `"$($e.config)`"" -WorkingDirectory $Destino
+    & $Py "$Destino\launcher.py" --autoteste "$Destino\$($e.config)"
+    if ($LASTEXITCODE -ne 0) { Aviso "o launcher não conseguiu arrancar o sync de $($e.nome) (ver acima); a tarefa fica criada e o launcher avisa a Lonntra" }
     Register-ScheduledTask -TaskName $e.tarefa -Action $acao -Trigger $gatilho -Settings $definicoes -Principal $quem `
         -Description "primavera-sync ($($e.nome)): envia documentos, artigos e stock do Primavera para a Lonntra (só leitura)." -Force | Out-Null
     Start-ScheduledTask -TaskName $e.tarefa

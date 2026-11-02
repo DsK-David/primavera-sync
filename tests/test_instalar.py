@@ -174,3 +174,34 @@ class SenhaExistenteTest(unittest.TestCase):
                                              "Trusted_Connection=yes\n", encoding="utf-8")
             self.assertEqual(instalar.senha_existente(raiz), "abc-DEF_123aA9", "config sem login SQL não conta")
 
+
+class InstalarVersaoTest(unittest.TestCase):
+    def preparar(self, tmp):
+        raiz = Path(tmp)
+        (raiz / "primavera_sync").mkdir()
+        (raiz / "primavera_sync" / "__init__.py").write_text("", encoding="utf-8")
+        (raiz / "primavera_sync" / "__pycache__").mkdir()
+        (raiz / "primavera_sync" / "__pycache__" / "x.pyc").write_bytes(b"")
+        return raiz
+
+    def test_copia_o_pacote_para_versoes_e_aponta_a_empresa(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(instalar, "PASTA", Path(tmp)):
+            raiz = self.preparar(tmp)
+            empresa = raiz / "empresas" / "custom"
+            v = instalar.instalar_versao(empresa)
+            self.assertTrue((raiz / "versoes" / v / "primavera_sync" / "__init__.py").is_file())
+            self.assertFalse((raiz / "versoes" / v / "primavera_sync" / "__pycache__").exists())
+            self.assertEqual((empresa / "atual.txt").read_text(encoding="utf-8"), v)
+            self.assertFalse((empresa / "anterior.txt").exists())
+
+    def test_reinstalar_guarda_a_versao_anterior_e_limpa_a_marca_de_falha(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(instalar, "PASTA", Path(tmp)):
+            raiz = self.preparar(tmp)
+            empresa = raiz / "empresas" / "custom"
+            empresa.mkdir(parents=True)
+            (empresa / "atual.txt").write_text("1.0.0", encoding="utf-8")
+            (raiz / "versoes" / instalar.__version__).mkdir(parents=True)
+            (raiz / "versoes" / instalar.__version__ / "FALHOU").write_text("x", encoding="utf-8")
+            instalar.instalar_versao(empresa)
+            self.assertEqual((empresa / "anterior.txt").read_text(encoding="utf-8"), "1.0.0")
+            self.assertFalse((raiz / "versoes" / instalar.__version__ / "FALHOU").exists())
