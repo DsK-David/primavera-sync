@@ -94,7 +94,7 @@ class Launcher:
         return [sys.executable, "-m", "primavera_sync.sincronizador", str(self.config)]
 
     def ambiente(self, versao):
-        env = dict(os.environ, PYTHONUNBUFFERED="1")
+        env = dict(os.environ, PYTHONUNBUFFERED="1", PRIMAVERA_LAUNCHER="1")  # o sync só se atualiza debaixo do launcher
         pacote = str(self.pacote(versao))
         env["PYTHONPATH"] = pacote + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         return env

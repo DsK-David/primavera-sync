@@ -8,3 +8,4 @@ config.ini
 relatorio-instalacao.txt
 logs/
 clientes/*/cliente.ini
+dist/

@@ -423,3 +423,19 @@ A tarefa do Windows já não corre o sync diretamente: corre o `launcher.py`, qu
 Ficheiros por empresa: `atual.txt` (a que deve correr), `estavel.txt` (a última que deu ciclos bons), `anterior.txt`, `saude.json`, `prova.json` (uma versão em prova), `launcher.log`. O `estado.bat` mostra-os.
 
 `python launcher.py --autoteste empresas\<empresa>\config.ini` verifica que o launcher consegue arrancar o sync (o instalador corre-o). Sem a pasta `versoes\`, o launcher usa o `primavera_sync` ao lado dele (instalações antigas).
+
+## Atualizar o sync à distância (publicar uma versão)
+
+No teu Mac (uma vez: `~/.primavera-sync/venv` com a biblioteca `cryptography` e a chave privada em `~/.primavera-sync/assinatura.key`, criadas com `scripts/assinatura.py gerar`):
+
+```
+git commit …                                                               # a série é o nº de commits
+~/.primavera-sync/venv/bin/python scripts/publicar.py 1.3.0                 # só constrói e assina em dist/
+~/.primavera-sync/venv/bin/python scripts/publicar.py 1.3.0 --publicar      # envia para a Lonntra, canal «teste»
+ssh lonntra 'cd /var/www/lonntra && sudo -u www-data php yii integracao/versoes'
+ssh lonntra 'cd /var/www/lonntra && sudo -u www-data php yii integracao/versao-promover 1.3.0'   # depois de ver que funciona: todas as empresas
+```
+
+Como chega ao cliente: o sinal de vida (de minuto a minuto) traz a oferta. O sync **só aceita** um pacote com o SHA-256 certo, **assinado** por uma chave de `chaves.json`, de série maior do que a que corre; extrai-o sem sair da pasta, compila, importa e corre o `--verificar` com o config real. Só então muda o `atual.txt`, e o launcher reinicia o sync na versão nova. Se a nova não der um ciclo bom em 10 minutos, o launcher volta à anterior.
+
+Canais: as empresas do canal `teste` recebem as versões novas primeiro (`php yii integracao/canal <NIF> teste`); as `estavel`, só depois de `versao-promover`. Para fixar ou recuar uma empresa: `php yii integracao/alvo <NIF> 1.2.0` (`-` volta a seguir o canal). Uma versão que ainda esteja no disco do cliente troca-se sem descarregar.

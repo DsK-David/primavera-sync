@@ -1,5 +1,6 @@
 """Cliente da rota de integração do Primavera na Lonntra (/integracao/primavera, ADR-061 da Lonntra)."""
 import json
+import re
 import urllib.error
 import urllib.request
 
@@ -57,3 +58,21 @@ class Lonntra:
         """Devolve {'armazens', 'movimentos', 'existencias', 'erros': [{'codigo', 'erro'}]}."""
         return self._pedido("POST", "/integracao/primavera/stock",
                             {"armazens": list(armazens), "movimentos": list(movimentos), "existencias": list(existencias)})
+
+    def pacote(self, versao, maximo=8 * 1024 * 1024):
+        """Descarrega o zip de uma versão do sync. O endereço é montado aqui, nunca vem da resposta: a chave da empresa só
+        vai para a Lonntra. O que se devolve só é de confiança depois de conferido o SHA-256 e a assinatura (atualizador.py)."""
+        if not re.fullmatch(r"\d{1,3}\.\d{1,3}\.\d{1,3}", str(versao)):
+            raise ErroApi("versão inválida")
+        pedido = urllib.request.Request(self.url + f"/integracao/primavera/pacote/{versao}", method="GET",
+                                        headers={"Authorization": f"Bearer {self.chave}"})
+        try:
+            with urllib.request.urlopen(pedido, timeout=self.timeout) as r:
+                dados = r.read(maximo + 1)
+        except urllib.error.HTTPError as e:
+            raise ErroLigacao(f"{e.code}: {e.reason}") from None
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            raise ErroLigacao(str(e)) from None
+        if len(dados) > maximo:
+            raise ErroApi("o pacote é maior do que o permitido")
+        return dados

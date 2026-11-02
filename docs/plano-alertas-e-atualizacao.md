@@ -190,7 +190,7 @@ Cada atualização, comando e configuração fica no **registo da Lonntra** (que
 | Passo | O quê | Valor |
 |---|---|---|
 | **U1** ✅ *feito (01/11)* | `launcher.py` + estrutura `versoes/` + recuo + `saude.json` + reversão + instalador que o põe (instalação manual, uma última vez) | acaba a tempestade de reinícios; versões que falham revertem e avisam |
-| **U2** | `scripts/publicar.sh` + assinatura + `integracao_versao` + endpoint do pacote + `Atualizador` no cliente (canal `teste`, piloto = Auto Style Custom) | **atualizar de casa** |
+| **U2** ✅ *feito (02/11, por pôr em produção)* | `scripts/publicar.py` + assinatura Ed25519 + `integracao_versao` + endpoint do pacote + `atualizador.py` no cliente (canal `teste`, piloto = Auto Style Custom) | **atualizar de casa** |
 | **U3** | Reversão automática + `VERSAO_ALVO` + `launcher.py --autoteste` | segurança |
 | **U4** | Config remota + comandos remotos | diagnosticar e corrigir sem entrar no servidor |
 | **U5** | Painel de Super Admin (versões por empresa, publicar/promover/fixar, comandos) | operar sem linha de comandos |

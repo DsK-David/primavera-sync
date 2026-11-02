@@ -556,13 +556,31 @@ def escrever_saude(pasta, erro=None, ciclo_ok=True, agora=None):
 
 
 def dar_sinal(lonntra, estado, erro_ciclo=None, erro_catalogo=None):
-    """O sinal de vida nunca derruba o sync: qualquer falha (a Lonntra em baixo, uma recusa 422…) fica só no log."""
+    """O sinal de vida nunca derruba o sync: qualquer falha (a Lonntra em baixo, uma recusa 422…) fica só no log.
+    Devolve a resposta da Lonntra (que pode trazer uma versão nova do sync para atualizar), ou None."""
     try:
-        lonntra.sinal(estado_do_sync(estado, erro_ciclo, erro_catalogo))
-        return True
+        return lonntra.sinal(estado_do_sync(estado, erro_ciclo, erro_catalogo)) or {"ok": True}
     except Exception as e:  # noqa: BLE001
         log.warning("Sem sinal para a Lonntra: %s", e)
-        return False
+        return None
+
+
+def atualizar(resposta, config, lonntra, estado):
+    """Se a Lonntra ofereceu uma versão nova do sync, trata dela (atualizador.py). Nunca derruba o sync."""
+    oferta = (resposta or {}).get("atualizar")
+    if not oferta:
+        return None
+    try:
+        from .atualizador import Atualizador
+        base = Path.cwd()  # o launcher arranca o sync na pasta onde está (launcher.py, chaves.json, versoes\)
+        if not Atualizador.disponivel(base):
+            log.info("A Lonntra ofereceu a versão %s, mas a atualização à distância não está ligada (sem launcher ou chaves.json).",
+                     oferta.get("versao"))
+            return None
+        return Atualizador(base, Path(config).resolve().parent, config, lonntra, estado).tratar(oferta)
+    except Exception:  # noqa: BLE001
+        log.exception("Erro ao tratar a atualização")
+        return None
 
 
 def estado_do_sync(estado, erro_ciclo=None, erro_catalogo=None):
@@ -735,7 +753,8 @@ def main(argv=None):
             erro_ciclo = f"{type(e).__name__}: {e}"[:300]
             log.exception("Erro no ciclo; volto a ligar ao SQL Server e tento outra vez daqui a %ds.", intervalo)
             sinc = None
-        dar_sinal(lonntra, estado, erro_ciclo, sinc.erro_catalogo if sinc else None)
+        resposta = dar_sinal(lonntra, estado, erro_ciclo, sinc.erro_catalogo if sinc else None)
+        atualizar(resposta, a.config, lonntra, estado)
         escrever_saude(Path(a.config).resolve().parent, erro_ciclo, ciclo_ok=erro_ciclo is None)
         estado.copia_diaria()
         if a.uma_vez:

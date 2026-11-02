@@ -31,7 +31,7 @@ Titulo "Ficheiros"
 New-Item -ItemType Directory -Force -Path $Destino, "$Destino\logs" | Out-Null
 if ((Resolve-Path $Origem).Path -ne (Resolve-Path $Destino).Path) {
     Copy-Item -Recurse -Force "$Origem\primavera_sync" $Destino
-    foreach ($f in "config.example.ini", "instalar.bat", "instalar.ps1", "launcher.py", "estado.bat", "estado.ps1", "desinstalar.bat", "desinstalar.ps1", "cliente.ini") {
+    foreach ($f in "config.example.ini", "instalar.bat", "instalar.ps1", "launcher.py", "chaves.json", "estado.bat", "estado.ps1", "desinstalar.bat", "desinstalar.ps1", "cliente.ini") {
         if (Test-Path "$Origem\$f") { Copy-Item -Force "$Origem\$f" $Destino }
     }
 }
@@ -68,6 +68,9 @@ Ok "Python: $Py"
 & $Py -m pip install --upgrade --quiet --disable-pip-version-check pyodbc
 if ($LASTEXITCODE -ne 0) { Falha "não consegui instalar o pyodbc (precisa de internet)." }
 Ok "pyodbc instalado"
+# «cryptography» confere a assinatura das versões novas do sync (atualização à distância). Sem ela o sync funciona, mas não se atualiza sozinho.
+& $Py -m pip install --upgrade --quiet --disable-pip-version-check --only-binary :all: cryptography
+if ($LASTEXITCODE -ne 0) { Aviso "não consegui instalar a biblioteca «cryptography»: o sync funciona, mas não se atualiza à distância" } else { Ok "cryptography instalada (atualização à distância)" }
 $drivers = (Get-OdbcDriver -Platform "64-bit" | Where-Object { $_.Name -match "SQL Server" }).Name
 if (-not $drivers) { Falha "não há nenhum driver ODBC do SQL Server. Instale o «ODBC Driver 18 for SQL Server» da Microsoft." }
 Ok ("drivers ODBC: " + ($drivers -join ", "))
