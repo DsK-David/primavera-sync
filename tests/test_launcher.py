@@ -1,8 +1,10 @@
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import launcher
@@ -370,3 +372,115 @@ class LauncherAtualizadoTest(unittest.TestCase):
                                     capture_output=True, text=True, cwd=str(base))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("sync 7.7.7", r.stdout)
+
+
+class AutocuraDasTarefasTest(unittest.TestCase):
+    """Uma reinstalação de uma só empresa apagou a tarefa da outra: o launcher volta a criá-la, sem ninguém ir ao servidor."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.logs, self.chamadas = [], []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def empresa(self, pasta, valida=True):
+        d = self.base / pasta if pasta else self.base
+        d.mkdir(parents=True, exist_ok=True)
+        texto = "[primavera]\nligacao = DRIVER={x};SERVER=S\n[lonntra]\nchave = k.s\n" if valida else "[lonntra]\n"
+        (d / "config.ini").write_text(texto, encoding="utf-8")
+
+    def schtasks(self, existentes):
+        saida = "".join(f'"\\{n}","N/A","Ready"\r\n' for n in existentes)
+
+        def executar(cmd, **kw):
+            self.chamadas.append(cmd)
+            if cmd[0] == "schtasks":
+                return SimpleNamespace(returncode=0, stdout=saida, stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return executar
+
+    def test_empresas_instaladas_so_as_com_config_valido(self):
+        self.empresa(None)
+        self.empresa("empresas/auto-style-custom")
+        self.empresa("empresas/lixo", valida=False)
+        (self.base / "empresas" / "sem-config").mkdir()
+        self.assertEqual([n for n, _ in launcher.empresas_instaladas(self.base)], ["PrimaveraLonntra", "PrimaveraLonntra-auto-style-custom"])
+
+    def test_le_os_nomes_das_tarefas_do_schtasks(self):
+        nomes = launcher.tarefas_registadas(self.schtasks(["PrimaveraLonntra-x", "Outra tarefa"]))
+        self.assertEqual(nomes, {"PrimaveraLonntra-x", "Outra tarefa"})
+
+    def test_cria_so_a_tarefa_que_falta(self):
+        self.empresa(None)
+        self.empresa("empresas/auto-style-custom")
+        criadas = launcher.curar_tarefas(self.base, self.logs.append, self.schtasks(["PrimaveraLonntra-auto-style-custom"]), python="python.exe")
+        self.assertEqual(criadas, ["PrimaveraLonntra"])
+        powershell = [c for c in self.chamadas if c[0] == "powershell"]
+        self.assertEqual(len(powershell), 1)
+        import base64
+        script = base64.b64decode(powershell[0][-1]).decode("utf-16-le")
+        self.assertIn("-TaskName 'PrimaveraLonntra'", script)
+        self.assertIn("-Execute 'python.exe'", script)
+        self.assertIn("launcher.py \"config.ini\"", script)
+        self.assertIn("-UserId 'SYSTEM'", script)
+        self.assertIn("Start-ScheduledTask -TaskName 'PrimaveraLonntra'", script)
+
+    def test_tudo_em_dia_nao_faz_nada(self):
+        self.empresa(None)
+        self.assertEqual(launcher.curar_tarefas(self.base, self.logs.append, self.schtasks(["PrimaveraLonntra"])), [])
+        self.assertFalse([c for c in self.chamadas if c[0] == "powershell"])
+
+    def test_o_ficheiro_tarefas_manual_desliga_a_autocura(self):
+        self.empresa(None)
+        (self.base / "tarefas.manual").write_text("", encoding="utf-8")
+        self.assertEqual(launcher.curar_tarefas(self.base, self.logs.append, self.schtasks([])), [])
+        self.assertEqual(self.chamadas, [])
+
+    def test_nunca_levanta_e_diz_o_que_falhou(self):
+        self.empresa(None)
+
+        def executar(cmd, **kw):
+            raise OSError("sem permissões")
+        self.assertEqual(launcher.curar_tarefas(self.base, self.logs.append, executar), [])
+        self.assertTrue(any("falhou" in l for l in self.logs))
+
+        def falha_a_criar(cmd, **kw):
+            return SimpleNamespace(returncode=1 if cmd[0] == "powershell" else 0, stdout="", stderr="acesso negado")
+        self.assertEqual(launcher.curar_tarefas(self.base, self.logs.append, falha_a_criar), [])
+        self.assertTrue(any("não consegui criar" in l for l in self.logs))
+
+    def test_nomes_e_caminhos_estranhos_sao_recusados(self):
+        base, config = self.base, self.base / "empresas" / "x" / "config.ini"
+        for nome in ("PrimaveraLonntra'; Remove-Item *", "Outra", "PrimaveraLonntra-a b"):
+            with self.assertRaises(ValueError):
+                launcher.script_tarefa(base, nome, config, "python.exe")
+        with self.assertRaises(ValueError):
+            launcher.script_tarefa(base, "PrimaveraLonntra-x", base / "empresas" / "x'y" / "config.ini", "python.exe")
+        with self.assertRaises(ValueError):
+            launcher.script_tarefa(base, "PrimaveraLonntra-x", config, "py'thon.exe")
+
+    def test_o_launcher_cura_ao_arrancar_e_depois_de_15_minutos(self):
+        self.empresa(None)
+        agora = [1000.0]
+        l = Launcher(self.base, "config.ini", agora=lambda: agora[0], lancar=lambda *a, **k: Filho(), relatar=lambda t: None, log=self.logs.append)
+        l.curar = True
+        l.executar = self.schtasks([])
+        l.tick()
+        self.assertEqual(len([c for c in self.chamadas if c[0] == "powershell"]), 1, "ao arrancar")
+        agora[0] += 60
+        l.tick()
+        self.assertEqual(len([c for c in self.chamadas if c[0] == "powershell"]), 1, "ainda não passou o intervalo")
+        agora[0] += launcher.INTERVALO_CURA
+        l.tick()
+        self.assertEqual(len([c for c in self.chamadas if c[0] == "powershell"]), 2, "outra vez, passados 15 minutos")
+
+    def test_fora_do_windows_nao_cura(self):
+        self.empresa(None)
+        l = Launcher(self.base, "config.ini", lancar=lambda *a, **k: Filho(), relatar=lambda t: None, log=self.logs.append)
+        l.executar = self.schtasks([])
+        l.tick()
+        self.assertEqual(self.chamadas, [] if os.name != "nt" else self.chamadas)
+
+

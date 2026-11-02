@@ -485,3 +485,9 @@ Usar de preferência consultas de **estrutura** (`sys.tables`, `sys.columns`), c
 O pacote de cada versão do sync leva o `launcher.py`. Depois de aplicar a versão, o atualizador compara-o com o instalado e, se for diferente, corre o `--autoteste` do launcher **novo** (com a versão nova como alvo); só se passar é que o troca, guardando o anterior em `launcher.py.anterior`. O launcher em marcha vê que o ficheiro mudou, pára o sync, arranca o novo como processo filho (preso ao mesmo grupo de processos) e fica à espera dele. Uma falha no launcher não desfaz a atualização do sync: fica registada e o launcher antigo continua.
 
 Como o launcher que está a correr no servidor hoje (1.2.0) ainda tem o defeito da cópia antiga do `primavera_sync` à frente, **a primeira vez** que se instala esta versão tem de ser à mão (`instalar.bat` com o ZIP do GitHub). Daí para a frente, é tudo à distância.
+
+## O launcher recria as tarefas que faltam (autocura)
+
+Se uma instalação deixar uma empresa sem tarefa (por exemplo, reinstalar só uma empresa apagava a das outras, antes da 1.5.0), o **launcher** de qualquer empresa que esteja a correr trata disso: ao arrancar, e de 15 em 15 minutos, vê as pastas de empresas instaladas (a raiz com `config.ini`, e `empresas\<nome>`) e **cria a tarefa de cada uma que não a tenha** (`PrimaveraLonntra` para a raiz, `PrimaveraLonntra-<nome>` para as outras), com as mesmas regras do instalador: arranca com o Windows, como SYSTEM, e reinicia se parar. Nunca apaga nada. Fica registado no `launcher.log`. Para a desligar, criar um ficheiro `tarefas.manual` ao lado do `launcher.py`.
+
+Como o launcher se atualiza com o pacote assinado de cada versão, esta função chega aos servidores sem ninguém lá ir. O `instalar.bat` também deixou de apagar as tarefas de empresas instaladas à parte: se a pasta da empresa ainda existe, a tarefa fica e é retomada.

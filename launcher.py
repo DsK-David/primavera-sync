@@ -10,11 +10,15 @@ Faz quatro coisas:
   3. depois de mudar de versão, se a nova não der um ciclo bom em 10 min, ou morrer 3 vezes, volta à anterior,
      marca a nova como FALHOU e avisa a Lonntra (mesmo que a nova nem chegue a arrancar);
   4. se o `atual.txt` mudar, reinicia o filho na versão nova (é assim que uma atualização se aplica);
-  5. se o próprio launcher.py for substituído (o atualizador põe lá o do pacote novo, depois de ele passar o --autoteste), arranca o
+  5. autocura (só no Windows): ao arrancar, e de 15 em 15 minutos, cria a tarefa das empresas instaladas (pasta com config.ini) que
+     não tenham tarefa — por exemplo depois de uma reinstalação de uma só empresa ter apagado a das outras. Nunca apaga nada.
+     Para a desligar: criar um ficheiro «tarefas.manual» ao lado do launcher.py;
+  6. se o próprio launcher.py for substituído (o atualizador põe lá o do pacote novo, depois de ele passar o --autoteste), arranca o
      novo como processo filho e fica à espera dele (preso ao mesmo grupo de processos: parar a tarefa mata tudo). O anterior fica em
      launcher.py.anterior.
 Sem a pasta `versoes\\`, usa o `primavera_sync` ao lado do launcher (instalações antigas).
 """
+import base64
 import hashlib
 import json
 import os
@@ -24,9 +28,11 @@ import time
 import urllib.request
 from pathlib import Path
 
-LAUNCHER_VERSAO = "1.0.0"
+LAUNCHER_VERSAO = "1.1.0"
 ATRASOS = (10, 30, 60, 300)  # segundos entre arranques depois de o filho morrer
 SAIDA_REINICIAR = 75         # o sync pede para ser arrancado já (atualização aplicada)
+INTERVALO_CURA = 900         # segundos entre verificações das tarefas em falta
+PREFIXO_TAREFA = "PrimaveraLonntra"
 ESTAVEL_APOS = 600           # um filho que dura isto sem morrer deixa de contar falhas
 PROVA_SEGUNDOS = 600         # tempo que uma versão nova tem para dar um ciclo bom
 PROVA_FALHAS = 3             # ou mortes seguidas que a reprovam
@@ -61,6 +67,92 @@ def _hash(caminho):
         return None
 
 
+# ---------------------------------------------------------------------------------------------- autocura das tarefas
+
+def _config_valida(caminho):
+    """Um config.ini de uma empresa instalada: tem a chave da Lonntra e a ligação ao SQL Server."""
+    try:
+        import configparser
+        c = configparser.ConfigParser(interpolation=None)
+        c.read(caminho, encoding="utf-8")
+        return bool(c.get("lonntra", "chave", fallback="").strip()) and bool(c.get("primavera", "ligacao", fallback="").strip())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def empresas_instaladas(base):
+    """[(nome da tarefa, config.ini)] das empresas instaladas: a instalação antiga (config.ini na raiz) e empresas\\<nome>."""
+    base = Path(base)
+    out = []
+    if (base / "config.ini").is_file() and _config_valida(base / "config.ini"):
+        out.append((PREFIXO_TAREFA, base / "config.ini"))
+    pasta = base / "empresas"
+    if pasta.is_dir():
+        for d in sorted(p for p in pasta.iterdir() if p.is_dir()):
+            if (d / "config.ini").is_file() and _config_valida(d / "config.ini"):
+                out.append((f"{PREFIXO_TAREFA}-{d.name}", d / "config.ini"))
+    return out
+
+
+def tarefas_registadas(executar=subprocess.run):
+    """Nomes das tarefas agendadas do Windows (sem a barra inicial)."""
+    r = executar(["schtasks", "/query", "/fo", "csv", "/nh"], capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise OSError("schtasks /query falhou: " + (r.stderr or r.stdout)[-200:])
+    nomes = set()
+    for linha in r.stdout.splitlines():
+        campo = linha.split('","')[0].strip().strip('"')
+        if campo:
+            nomes.add(campo.lstrip("\\"))
+    return nomes
+
+
+def script_tarefa(base, nome, config, python):
+    """O PowerShell que cria e arranca a tarefa de uma empresa, igual à do instalar.ps1 (arranca com o Windows, como SYSTEM, reinicia
+    se parar). Recusa nomes ou caminhos que não sejam o que o instalador cria (nada de aspas nem de outra coisa)."""
+    import re
+    base, config = Path(base), Path(config)
+    rel = str(config.relative_to(base))
+    if not re.fullmatch(PREFIXO_TAREFA + r"(-[A-Za-z0-9._-]+)?", nome):
+        raise ValueError(f"nome de tarefa inesperado: {nome}")
+    for texto in (str(base), rel, str(python)):
+        if "'" in texto or '"' in texto or "\n" in texto or "`" in texto or "$" in texto:
+            raise ValueError(f"caminho com caracteres não permitidos: {texto}")
+    return (f"$acao = New-ScheduledTaskAction -Execute '{python}' -Argument 'launcher.py \"{rel}\"' -WorkingDirectory '{base}'; "
+            "$gatilho = New-ScheduledTaskTrigger -AtStartup; $gatilho.Delay = 'PT2M'; "
+            "$def = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) "
+            "-StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew; "
+            "$quem = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest; "
+            f"Register-ScheduledTask -TaskName '{nome}' -Action $acao -Trigger $gatilho -Settings $def -Principal $quem "
+            "-Description 'primavera-sync (criada pelo launcher: a empresa estava instalada e sem tarefa)' | Out-Null; "
+            f"Start-ScheduledTask -TaskName '{nome}'")
+
+
+def curar_tarefas(base, log, executar=subprocess.run, python=None):
+    """Cria as tarefas em falta. Devolve os nomes das que criou. Nunca levanta e nunca apaga nada."""
+    criadas = []
+    try:
+        if (Path(base) / "tarefas.manual").exists():
+            return criadas
+        existentes = tarefas_registadas(executar)
+        for nome, config in empresas_instaladas(base):
+            if nome in existentes:
+                continue
+            log(f"a empresa de {config} não tem tarefa («{nome}»): vou criá-la")
+            # codificado (UTF-16 em base64): não depende de como o Windows trata as aspas na linha de comandos
+            codigo = base64.b64encode(script_tarefa(base, nome, config, python or sys.executable).encode("utf-16-le")).decode()
+            r = executar(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", codigo],
+                         capture_output=True, text=True, timeout=120)
+            if r.returncode == 0:
+                criadas.append(nome)
+                log(f"tarefa «{nome}» criada e arrancada")
+            else:
+                log(f"não consegui criar a tarefa «{nome}»: {(r.stderr or r.stdout).strip()[-250:]}")
+    except Exception as e:  # noqa: BLE001
+        log(f"autocura das tarefas falhou: {type(e).__name__}: {e}")
+    return criadas
+
+
 def _json(caminho):
     try:
         return json.loads(Path(caminho).read_text(encoding="utf-8"))
@@ -82,6 +174,7 @@ class Launcher:
         self.relatar = relatar or self._relatar_lonntra
         self.log = log or self._log_ficheiro
         self.lancar_launcher = subprocess.Popen
+        self.curar, self.executar, self.proxima_cura = (os.name == "nt"), subprocess.run, 0.0
         self.filho = None
         self.versao_em_execucao = None
         self.arrancou_em = 0.0
@@ -174,6 +267,9 @@ class Launcher:
 
     def tick(self):
         agora = self.agora()
+        if self.curar and agora >= self.proxima_cura:
+            self.proxima_cura = agora + INTERVALO_CURA
+            curar_tarefas(self.base, self.log, self.executar)
         if self.filho is not None and self.filho.poll() is None:  # a correr
             if agora - self.arrancou_em > ESTAVEL_APOS:
                 self.falhas = 0

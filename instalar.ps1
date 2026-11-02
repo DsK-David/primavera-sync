@@ -115,10 +115,18 @@ foreach ($e in $empresas) {
     Start-ScheduledTask -TaskName $e.tarefa
     Ok "tarefa «$($e.tarefa)» ($($e.nome)): arranca com o Windows, como SYSTEM, e volta a arrancar se parar"
 }
-# tarefas de empresas que já não estão na instalação (ex.: PrimaveraLonntra de antes, agora com outro nome)
+# tarefas de uma instalação anterior que não estão nesta execução: uma empresa instalada à parte NÃO se apaga. Se a pasta da empresa
+# ainda existe (o config.ini está lá), a tarefa fica e volta a arrancar; só se remove a de uma empresa que já não existe.
 Get-ScheduledTask -TaskName "$Prefixo*" -ErrorAction SilentlyContinue | Where-Object { $empresas.tarefa -notcontains $_.TaskName } | ForEach-Object {
-    Aviso "a tarefa antiga «$($_.TaskName)» não está na instalação e foi removida"
-    Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false
+    $nome = $_.TaskName
+    $config = if ($nome -eq $Prefixo) { "$Destino\config.ini" } else { "$Destino\empresas\$($nome.Substring($Prefixo.Length + 1))\config.ini" }
+    if (Test-Path $config) {
+        Start-ScheduledTask -TaskName $nome -ErrorAction SilentlyContinue
+        Aviso "a tarefa «$nome» é de uma empresa instalada à parte: fica como estava e foi retomada"
+    } else {
+        Aviso "a tarefa «$nome» é de uma empresa que já não existe nesta pasta e foi removida"
+        Unregister-ScheduledTask -TaskName $nome -Confirm:$false
+    }
 }
 
 # ---------------------------------------------------------------- 5. primeiro ciclo de cada empresa
