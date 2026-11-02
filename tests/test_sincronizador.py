@@ -2,7 +2,7 @@ import configparser
 import tempfile
 import unittest
 from unittest import mock
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from primavera_sync.lonntra import ErroApi, ErroLigacao
@@ -138,15 +138,57 @@ class SincronizadorTest(unittest.TestCase):
         self.assertEqual(self.api.pedidos[1]["documento"]["tipo"], "NC")
 
     def test_recusa_da_lonntra_fica_em_erro_e_nao_trava_os_outros(self):
-        self.fonte.docs = [doc("A", "FA", 1, 1040), doc("B", "FA", 2, 9200)]
+        hoje = date.today()
+        self.fonte.docs = [doc("A", "FA", 1, 1040, data=hoje), doc("B", "FA", 2, 9200, data=hoje)]
         self.fonte.linhas_ = {"A": [linha("A", "OLEO", 1, 1000, taxa=4)], "B": [linha("B", "PNEU", 1, 8000)]}
         self.assertEqual(self.s.ciclo(), {"documentos": 1, "erros": 1})
         _, erros = self.estado.resumo()
         self.assertEqual(erros[0][0], "FA 2026/1")
-        # tenta outra vez nos ciclos seguintes, até max_tentativas
-        for _ in range(10):
+        # não insiste de minuto a minuto: espera 5 min, depois 10, 20… (e nunca desiste)
+        for _ in range(5):
             self.s.ciclo()
-        self.assertEqual(len([p for p in self.api.pedidos if p["documento"]["id"] == "A"]), 5)
+        self.assertEqual(len([p for p in self.api.pedidos if p["documento"]["id"] == "A"]), 1)
+        for esperado in (2, 3, 4):
+            self.recuar_ultima_tentativa(minutos=24 * 60)
+            self.s.ciclo()
+            self.assertEqual(len([p for p in self.api.pedidos if p["documento"]["id"] == "A"]), esperado)
+
+    def recuar_ultima_tentativa(self, minutos):
+        antes = (datetime.now() - timedelta(minutes=minutos)).isoformat(timespec="seconds")
+        with self.estado.conn:
+            self.estado.conn.execute("UPDATE erros SET ultima=?", (antes,))
+
+    def test_documento_recusado_e_corrigido_depois_segue_mesmo_com_mais_de_30_dias(self):
+        antigo = date.today() - timedelta(days=90)
+        self.fonte.docs = [doc("A", "FA", 1, 1040, data=antigo)]
+        self.fonte.linhas_ = {"A": [linha("A", "OLEO", 1, 1000, taxa=4)]}
+        self.assertEqual(self.s.ciclo(), {"documentos": 0, "erros": 1})  # carga completa: lê tudo
+        self.assertEqual(self.estado.datas_de_erros(), {"A": antigo.isoformat()})
+        # a Lonntra passa a aceitar (criou-se a taxa): a linha passa a ter uma taxa que ela conhece
+        self.fonte.linhas_ = {"A": [linha("A", "OLEO", 1, 1000, taxa=15)]}
+        self.s.ciclo()  # ainda dentro da espera de 5 min
+        self.assertNotIn("A", self.estado.enviados())
+        self.recuar_ultima_tentativa(minutos=10)
+        self.assertEqual(self.s.ciclo(), {"documentos": 1, "erros": 0})
+        self.assertIn("A", self.estado.enviados())
+        self.assertEqual(self.estado.resumo()[1], [])
+
+    def test_espera_entre_tentativas(self):
+        self.assertEqual([Estado.espera(n) for n in (1, 2, 3, 4, 10, 20)], [5, 10, 20, 40, 1440, 1440])
+
+    def test_estado_antigo_sem_a_coluna_data_migra(self):
+        caminho = str(Path(self.tmp.name) / "velho.db")
+        import sqlite3
+        c = sqlite3.connect(caminho)
+        c.execute("CREATE TABLE erros (documento TEXT PRIMARY KEY, numero TEXT NOT NULL, mensagem TEXT NOT NULL, "
+                  "tentativas INTEGER NOT NULL, ultima TEXT NOT NULL)")
+        c.execute("INSERT INTO erros VALUES ('A','FA 1','x',1,'2026-10-01T10:00:00')")
+        c.commit()
+        c.close()
+        e = Estado(caminho)
+        e.erro("A", "FA 1", "y", "2026-09-01")
+        self.assertEqual(e.datas_de_erros(), {"A": "2026-09-01"})
+        e.conn.close()
 
     def test_lonntra_em_baixo_para_o_ciclo_e_repete_depois(self):
         self.fonte.docs = [doc("A", "FA", 1, 18400)]
@@ -226,15 +268,43 @@ class CatalogoTest(unittest.TestCase):
         self.assertFalse(self.api.pedidos_artigos[-1][0]["ativo"])
         self.assertNotEqual(self.fonte.desde_movimentos, date(1900, 1, 1), "depois só os movimentos recentes")
 
-    def test_recusas_ficam_registadas_e_repetem(self):
+    def test_recusas_ficam_registadas(self):
         self.fonte.catalogo_[1] = {**self.fonte.catalogo_[1], "Taxa": None}
-        self.fonte.existencias_.append({"Artigo": "MO", "Armazem": "A1", "Quantidade": 1})
         r = self.s.catalogo()
-        self.assertEqual((r["artigos"], r["existencias"]), (1, 1))
+        self.assertEqual(r["artigos"], 1)
         _, erros = self.estado.resumo()
-        self.assertEqual({e[0] for e in erros}, {"artigo MO", "existencia MO@A1"})
+        self.assertEqual({e[0] for e in erros}, {"artigo MO"})
+
+    def test_item_recusado_nao_se_reenvia_no_mesmo_dia_mas_volta_amanha(self):
+        self.fonte.catalogo_[1] = {**self.fonte.catalogo_[1], "Taxa": None}
+        self.s.catalogo()
         self.assertEqual(self.s.catalogo()["artigos"], 0)
-        self.assertEqual(len(self.api.pedidos_artigos[-1]), 1, "o artigo recusado volta a ser enviado")
+        self.assertEqual(len(self.api.pedidos_artigos), 1, "hoje não volta a ser enviado")
+        with mock.patch.object(Sincronizador, "_marca", staticmethod(lambda v: f"{v}@amanha")):
+            self.s.catalogo()
+        self.assertEqual(len(self.api.pedidos_artigos), 2, "no dia seguinte tenta-se outra vez")
+
+    def test_item_recusado_que_muda_reenvia_logo(self):
+        self.fonte.catalogo_[1] = {**self.fonte.catalogo_[1], "Taxa": None}
+        self.s.catalogo()
+        self.fonte.catalogo_[1] = {**self.fonte.catalogo_[1], "Descricao": "Mão de obra (nova)"}
+        self.s.catalogo()
+        self.assertEqual(len(self.api.pedidos_artigos), 2)
+
+    def test_servicos_nao_enviam_existencias_e_limpam_erros_antigos(self):
+        self.fonte.existencias_.append({"Artigo": "MO", "Armazem": "A1", "Quantidade": 1})
+        self.estado.erro("existencia:MO@A1", "existencia MO@A1", "é um serviço")
+        r = self.s.catalogo()
+        self.assertEqual(r["existencias"], 1, "só o artigo com stock")
+        enviadas = [e["artigo"] for p in self.api.pedidos_stock for e in p["existencias"]]
+        self.assertNotIn("MO", enviadas)
+        self.assertEqual(self.estado.resumo()[1], [], "o erro antigo desaparece")
+
+    def test_existencia_aceite_depois_apaga_o_erro_dela(self):
+        self.fonte.existencias_ = [{"Artigo": "PN195", "Armazem": "A1", "Quantidade": 3}]
+        self.estado.erro("existencia:PN195@A1", "existencia PN195@A1", "o artigo não está na Lonntra")
+        self.s.catalogo()
+        self.assertEqual(self.estado.resumo()[1], [])
 
     def test_erro_no_stock_nao_impede_os_documentos(self):
         def falha(desde):
@@ -350,3 +420,71 @@ class ImprimirTesteTest(unittest.TestCase):
         from primavera_sync.sincronizador import imprimir_teste
         with mock.patch("builtins.print"):
             self.assertTrue(imprimir_teste(self.resultado(0), 10))
+
+
+class RobustezTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = configparser.ConfigParser(interpolation=None)
+        self.cfg.read(CONFIG, encoding="utf-8")
+        self.cfg["sincronizacao"]["catalogo"] = "nao"
+        self.fonte, self.api = FontePrimavera(), LonntraFalsa()
+        self.estado = Estado(str(Path(self.tmp.name) / "estado.db"))
+        self.s = Sincronizador(self.fonte, self.api, self.estado, self.cfg)
+        self.fonte.clientes_ = {"C001": {"Cliente": "C001", "Nome": "Cliente"}}
+        self.fonte.artigos_ = {"PNEU": {"Artigo": "PNEU", "Descricao": "Pneu", "TipoArtigo": "3"}}
+
+    def tearDown(self):
+        self.estado.conn.close()
+        self.tmp.cleanup()
+
+    def test_um_documento_com_dados_estranhos_nao_para_os_outros(self):
+        hoje = date.today()
+        estranho = doc("X", "FA", 1, 100, data=hoje)
+        del estranho["TotalDocumento"]  # KeyError ao preparar o corpo
+        self.fonte.docs = [estranho, doc("B", "FA", 2, 9200, data=hoje)]
+        self.fonte.linhas_ = {"X": [linha("X", "PNEU", 1, 100)], "B": [linha("B", "PNEU", 1, 8000)]}
+        with self.assertLogs("primavera_sync", level="ERROR"):
+            r = self.s.ciclo()
+        self.assertEqual(r, {"documentos": 1, "erros": 1})
+        self.assertIn("KeyError", self.estado.resumo()[1][0][1])
+
+    def test_a_lonntra_em_baixo_continua_a_parar_o_ciclo(self):
+        self.fonte.docs = [doc("A", "FA", 1, 100, data=date.today())]
+        self.fonte.linhas_ = {"A": [linha("A", "PNEU", 1, 100)]}
+        self.api.em_baixo = True
+        with self.assertRaises(ErroLigacao):
+            self.s.ciclo()
+
+    def test_o_sinal_nunca_derruba_o_sync(self):
+        from primavera_sync.sincronizador import dar_sinal
+
+        class Recusa:
+            def sinal(self, estado):
+                raise ErroApi("422")
+
+        with self.assertLogs("primavera_sync", level="WARNING"):
+            self.assertFalse(dar_sinal(Recusa(), self.estado))
+
+        class Boa:
+            def sinal(self, estado):
+                return {"ok": True}
+        self.assertTrue(dar_sinal(Boa(), self.estado))
+
+    def test_copia_diaria_do_estado(self):
+        self.estado.marcar("A", "FA 1", "x")
+        self.estado.copia_diaria()
+        copias = list(Path(self.tmp.name).glob("estado.db.*.bak"))
+        self.assertEqual(len(copias), 1)
+        copia = Estado(str(copias[0]))
+        self.assertEqual(copia.resumo()[0], 1)
+        copia.conn.close()
+        self.estado.copia_diaria()  # no mesmo dia não repete
+        self.assertEqual(len(list(Path(self.tmp.name).glob("estado.db.*.bak"))), 1)
+
+    def test_copias_antigas_sao_apagadas(self):
+        for dia in range(1, 11):
+            (Path(self.tmp.name) / f"estado.db.2020-01-{dia:02d}.bak").write_bytes(b"")
+        self.estado.copia_diaria(manter=7)
+        self.assertLessEqual(len(list(Path(self.tmp.name).glob("estado.db.*.bak"))), 7)
+

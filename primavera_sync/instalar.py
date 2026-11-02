@@ -124,6 +124,21 @@ def slug(nome, chave=""):
     return t or (chave[:8] or "empresa")
 
 
+def senha_existente(pasta=None):
+    """A palavra-passe do login de leitura que já está num config.ini deste servidor (da raiz ou de empresas/*).
+    O login é um só no SQL Server: mudar-lhe a palavra-passe deixava sem acesso as empresas instaladas antes."""
+    pasta = pasta or PASTA
+    for config in [pasta / "config.ini", *sorted((pasta / "empresas").glob("*/config.ini"))]:
+        try:
+            texto = config.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        m = re.search(r"UID=" + re.escape(LOGIN) + r";PWD=\{?([^;}\r\n]+)", texto, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
 def parece_id(texto):
     """A Lonntra devolve às vezes o ID da empresa (UUID) em vez do nome."""
     return bool(re.fullmatch(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", (texto or "").strip()))
@@ -433,6 +448,12 @@ def passo_codigos(admin, base, cliente):
         except Exception as e:  # noqa: BLE001 - outra versão do Primavera: pergunta sem a lista
             aviso(f"não consegui listar os tipos de artigo ({str(e)[:140]}).")
         servicos = perguntar("Que tipos são serviços (sem stock)? Separe por vírgulas", ",".join(propostos))
+        while not servicos.strip():
+            aviso("nenhum tipo de artigo foi marcado como serviço: a mão de obra e outros serviços iriam como artigos com stock, "
+                  "e a Lonntra recusaria as existências deles a cada ciclo.")
+            if sim("Confirma que esta empresa não tem serviços?", False):
+                break
+            servicos = perguntar("Que tipos são serviços (sem stock)? Separe por vírgulas", ",".join(propostos))
     ok(f"serviços: tipo(s) {servicos or 'nenhum'}")
 
     # moeda dos preços e dos documentos: a Lonntra só recebe escudos
@@ -583,7 +604,8 @@ def main():
     try:
         empresas = passo_lonntra(cliente)
         driver, servidor, admin = passo_sql(cliente)
-        senha = secrets.token_urlsafe(18) + "aA9"  # a mesma para todas as bases: o login de leitura é um só
+        # a mesma para todas as bases e a que já estiver em uso: o login de leitura é um só no SQL Server
+        senha = senha_existente() or secrets.token_urlsafe(18) + "aA9"
         usadas, dados = [], []
         for n, e in enumerate(empresas, 1):
             pedida = cliente.get("primavera", "base", fallback="") if len(empresas) == 1 else ""
@@ -630,7 +652,9 @@ def main():
             manifesto.append({"nome": e.nome, "tarefa": e.tarefa, "config": str(rel / "config.ini"),
                               "log": str(rel / "primavera-sync.log")})
         (PASTA / "instalacao.json").write_text(json.dumps(manifesto, ensure_ascii=False, indent=2), encoding="utf-8")
-        return 0 if bem else 1
+        # 0: tudo bem; 2: as empresas ficaram configuradas mas alguma tem erros (o instalar.ps1 arranca as tarefas na mesma:
+        # o sync repete e avisa a Lonntra); 1 (nos outros casos): a configuração não ficou escrita
+        return 0 if bem else 2
     except SystemExit as e:
         erro(str(e))
         return 1

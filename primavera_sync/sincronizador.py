@@ -11,6 +11,8 @@ Uso:
 """
 import argparse
 import configparser
+import glob
+import os
 import hashlib
 import json
 import logging
@@ -63,8 +65,46 @@ COLETIVO = re.compile(r"\b(lda|limitada|s\.?\s?a|unipessoal|sociedade|empresa|as
 
 class Estado:
     def __init__(self, caminho):
+        self.caminho = str(caminho)
         self.conn = sqlite3.connect(caminho)
         self.conn.executescript(ESTADO_SQL)
+        if "data" not in {r[1] for r in self.conn.execute("PRAGMA table_info(erros)")}:  # estado de antes desta coluna
+            with self.conn:
+                self.conn.execute("ALTER TABLE erros ADD COLUMN data TEXT")
+
+    def copia_diaria(self, manter=7):
+        """Uma cópia do estado por dia (perdê-lo fazia reenviar o histórico todo). Nunca pára o sync."""
+        if self.caminho == ":memory:":
+            return
+        try:
+            destino = f"{self.caminho}.{date.today().isoformat()}.bak"
+            if os.path.exists(destino):
+                return
+            copia = sqlite3.connect(destino)
+            try:
+                self.conn.backup(copia)
+            finally:
+                copia.close()
+            for velha in sorted(glob.glob(f"{self.caminho}.*.bak"))[:-manter]:
+                os.remove(velha)
+        except Exception:  # noqa: BLE001
+            log.warning("Não consegui fazer a cópia diária do estado.", exc_info=True)
+
+    def limpar_erros(self, chaves):
+        with self.conn:
+            self.conn.executemany("DELETE FROM erros WHERE documento=?", [(c,) for c in chaves])
+
+    # itens que a Lonntra recusou: não se reenviam a cada ciclo (só se mudarem, ou uma vez por dia, para ver se já se
+    # resolveu o motivo, ex.: o artigo entretanto chegou)
+    def recusas(self, tipo):
+        return self.catalogo(f"recusa_{tipo}")
+
+    def guardar_recusas(self, tipo, valores):
+        self.guardar_catalogo(f"recusa_{tipo}", valores)
+
+    def esquecer_recusas(self, tipo, chaves):
+        with self.conn:
+            self.conn.executemany("DELETE FROM catalogo WHERE tipo=? AND chave=?", [(f"recusa_{tipo}", c) for c in chaves])
 
     def _agora(self):
         return datetime.now().isoformat(timespec="seconds")
@@ -77,15 +117,36 @@ class Estado:
             self.conn.execute("INSERT OR REPLACE INTO enviados VALUES (?,?,?,?)", (documento, numero, lonntra_id, self._agora()))
             self.conn.execute("DELETE FROM erros WHERE documento=?", (documento,))
 
-    def erro(self, documento, numero, mensagem):
+    def erro(self, documento, numero, mensagem, data=None):
         with self.conn:
             self.conn.execute(
-                "INSERT INTO erros VALUES (?,?,?,1,?) ON CONFLICT(documento) DO UPDATE SET "
-                "mensagem=excluded.mensagem, tentativas=tentativas+1, ultima=excluded.ultima",
-                (documento, numero, str(mensagem), self._agora()))
+                "INSERT INTO erros (documento, numero, mensagem, tentativas, ultima, data) VALUES (?,?,?,1,?,?) "
+                "ON CONFLICT(documento) DO UPDATE SET mensagem=excluded.mensagem, tentativas=tentativas+1, "
+                "ultima=excluded.ultima, data=COALESCE(excluded.data, data)",
+                (documento, numero, str(mensagem), self._agora(), data))
 
     def tentativas(self):
         return dict(self.conn.execute("SELECT documento, tentativas FROM erros"))
+
+    @staticmethod
+    def espera(tentativas):
+        """Minutos até voltar a tentar um documento recusado: 5, 10, 20… até 1 dia. Nunca desiste: se o motivo se
+        resolver (uma taxa de IVA criada na Lonntra, um cliente corrigido), o documento segue sozinho."""
+        return min(5 * 2 ** max(tentativas - 1, 0), 24 * 60)
+
+    def em_espera(self, agora=None):
+        """Documentos com erro cuja próxima tentativa ainda não chegou."""
+        agora = agora or datetime.now()
+        out = set()
+        for doc, tentativas, ultima in self.conn.execute("SELECT documento, tentativas, ultima FROM erros WHERE documento NOT LIKE '%:%'"):
+            if datetime.fromisoformat(ultima) + timedelta(minutes=self.espera(tentativas)) > agora:
+                out.add(doc)
+        return out
+
+    def datas_de_erros(self):
+        """{documento: data} dos documentos com erro, para os reler mesmo que já saiam da janela de revisão."""
+        return {d: dt for d, dt in self.conn.execute(
+            "SELECT documento, data FROM erros WHERE data IS NOT NULL AND documento NOT LIKE '%:%'")}
 
     def catalogo(self, tipo):
         return dict(self.conn.execute("SELECT chave, valor FROM catalogo WHERE tipo=?", (tipo,)))
@@ -157,8 +218,14 @@ class Sincronizador:
         self.s = cfg["sincronizacao"]
         self.tipos = {k.upper(): v.strip().upper() for k, v in cfg["tipos_documento"].items()}  # FA = FT
         self.modos = {k.upper(): v.strip() for k, v in cfg["modos_pagamento"].items()} if cfg.has_section("modos_pagamento") else {}
-        self.max_tentativas = self.s.getint("max_tentativas", 5)
         self.erro_catalogo = None
+        self.codigos_servico = set()  # artigos que são serviços (sem stock): preenchido ao enviar o catálogo
+        self._servicos_limpos = False
+
+    @staticmethod
+    def _marca(valor):
+        """Recusa de hoje: o mesmo valor volta a tentar-se amanhã, ou já se mudar."""
+        return f"{valor}@{date.today().isoformat()}"
 
     def ciclo(self, completo=False):
         if _txt(self.s.get("catalogo", "sim")).lower() not in ("nao", "não", "no", "false", "0", "off"):
@@ -215,7 +282,9 @@ class Sincronizador:
     def _artigos(self, limite=None):
         servicos = {t.strip() for t in self.s.get("tipos_artigo_servico", "").split(",") if t.strip()}
         feitos = self.estado.catalogo("artigo")
+        recusados = self.estado.recusas("artigo")
         novos = {}
+        codigos_servico = set()
         for a in self.fonte.catalogo(self.s.get("moeda", "CVE")):
             codigo = _txt(a["Artigo"])
             if not codigo:
@@ -236,14 +305,20 @@ class Sincronizador:
                 if _txt(a.get("Familia")) else None,
                 "ativo": not a.get("Anulado"),
             }
+            if item["servico"]:
+                codigos_servico.add(codigo)
             impressao = _impressao(item)
-            if feitos.get(codigo) != impressao:
+            if feitos.get(codigo) != impressao and recusados.get(codigo) != self._marca(impressao):
                 novos[codigo] = (item, impressao)
+        self.codigos_servico = codigos_servico
         enviados = 0
         for parte in _partes(list(novos.values())[:limite]):
             r = self.lonntra.artigos([i for i, _ in parte])
             erros = self._erros("artigo", r)
-            self.estado.guardar_catalogo("artigo", {i["codigo"]: h for i, h in parte if i["codigo"] not in erros})
+            aceites = {i["codigo"]: h for i, h in parte if i["codigo"] not in erros}
+            self.estado.guardar_catalogo("artigo", aceites)
+            self.estado.esquecer_recusas("artigo", aceites)
+            self.estado.guardar_recusas("artigo", {i["codigo"]: self._marca(h) for i, h in parte if i["codigo"] in erros})
             enviados += len(parte) - len(erros)
         return enviados
 
@@ -262,10 +337,11 @@ class Sincronizador:
 
         movimentos_ativos = _txt(self.s.get("movimentos_stock", "sim")).lower() not in ("nao", "não", "no", "false", "0", "off")
         feitos = self.estado.catalogo("movimento")
+        recusados = self.estado.recusas("movimento")
         desde, carga = self._historico("movimentos", completo)
         movimentos = []
         for m in (self.fonte.movimentos(desde or date(1900, 1, 1)) if movimentos_ativos else []):
-            if m["Id"] in feitos or _num(m.get("Quantidade")) == 0:
+            if m["Id"] in feitos or _num(m.get("Quantidade")) == 0 or recusados.get(m["Id"]) == self._marca(""):
                 continue
             tipo = _txt(m.get("EntradaSaida")).upper()[:1]
             if tipo not in ("E", "S"):
@@ -278,24 +354,37 @@ class Sincronizador:
         for parte in _partes(movimentos):
             erros = self._erros("movimento", self.lonntra.stock(movimentos=parte))
             self.estado.guardar_catalogo("movimento", {m["id"]: "" for m in parte if m["id"] not in erros})
+            self.estado.guardar_recusas("movimento", {m["id"]: self._marca("") for m in parte if m["id"] in erros})
             r["movimentos"] += len(parte) - len(erros)
         if carga and movimentos_ativos and not limite:
             self._carga_feita("movimentos")
 
         feitos = self.estado.catalogo("existencia")
-        existencias = {}
+        recusadas = self.estado.recusas("existencia")
+        existencias, servicos_ignorados = {}, []
         for e in self.fonte.existencias():
-            chave = f"{_txt(e['Artigo'])}|{_txt(e.get('Armazem'))}"
+            artigo = _txt(e["Artigo"])
+            chave = f"{artigo}|{_txt(e.get('Armazem'))}"
+            if artigo in self.codigos_servico:  # serviço não tem stock: a Lonntra recusa-o
+                servicos_ignorados.append(f"existencia:{artigo}@{_txt(e.get('Armazem'))}")
+                continue
             valor = f"{_num(e.get('Quantidade')):.4f}"
-            if feitos.get(chave) != valor:
+            if feitos.get(chave) != valor and recusadas.get(chave) != self._marca(valor):
                 existencias[chave] = valor
+        if servicos_ignorados and not self._servicos_limpos:  # erros de antes (quando ainda se enviavam)
+            self.estado.limpar_erros(servicos_ignorados)
+            self._servicos_limpos = True
         lista = [{"artigo": k.split("|")[0], "armazem": k.split("|")[1], "quantidade": float(v)} for k, v in existencias.items()]
         lista = lista[:limite]
         for parte in _partes(lista):
             erros = self._erros("existencia", self.lonntra.stock(existencias=parte))
-            ok = {f"{e['artigo']}|{e['armazem']}": existencias[f"{e['artigo']}|{e['armazem']}"] for e in parte
-                  if f"{e['artigo']}@{e['armazem']}" not in erros}
+            chaves = {f"{e['artigo']}|{e['armazem']}": f"{e['artigo']}@{e['armazem']}" for e in parte}
+            ok = {c: existencias[c] for c, recusa in chaves.items() if recusa not in erros}
             self.estado.guardar_catalogo("existencia", ok)
+            self.estado.esquecer_recusas("existencia", ok)
+            # o erro de uma existência chama-se «existencia:artigo@armazem»: o guardar_catalogo apaga «artigo|armazem»
+            self.estado.limpar_erros([f"existencia:{chaves[c]}" for c in ok])
+            self.estado.guardar_recusas("existencia", {c: self._marca(existencias[c]) for c, recusa in chaves.items() if recusa in erros})
             r["existencias"] += len(ok)
         return r
 
@@ -315,9 +404,9 @@ class Sincronizador:
     def documentos(self, completo=False):
         desde, carga = self._historico("documentos", completo)
 
-        feitos, tentativas = self.estado.enviados(), self.estado.tentativas()
-        docs = [d for d in self.fonte.documentos(list(self.tipos), desde)
-                if d["Id"] not in feitos and tentativas.get(d["Id"], 0) < self.max_tentativas]
+        feitos, em_espera = self.estado.enviados(), self.estado.em_espera()
+        docs = [d for d in self.fonte.documentos(list(self.tipos), self._desde_com_erros(desde))
+                if d["Id"] not in feitos and d["Id"] not in em_espera]
         if not docs:
             if carga:
                 self._carga_feita("documentos")
@@ -329,6 +418,14 @@ class Sincronizador:
             self._carga_feita("documentos")
         log.info("Ciclo terminado: %d enviado(s), %d com erro.", enviados, erros)
         return {"documentos": enviados, "erros": erros}
+
+    def _desde_com_erros(self, desde):
+        """A janela de revisão alarga-se até ao documento com erro mais antigo: um documento recusado e corrigido depois
+        (já passaram mais de `revisao_dias`) volta a ser tentado."""
+        if desde is None:
+            return None
+        antigas = [date.fromisoformat(str(d)[:10]) for d in self.estado.datas_de_erros().values() if d]
+        return min([desde, *antigas])
 
     def _enviar_documentos(self, docs):
         """Envia estes documentos. Devolve (enviados, com erro, números dos enviados)."""
@@ -344,9 +441,16 @@ class Sincronizador:
             try:
                 corpo = self.corpo(d, linhas.get(d["Id"], []), clientes, artigos, servicos)
                 r = self.lonntra.documento(corpo)
+            except ErroLigacao:
+                raise
             except (ErroApi, ValueError) as e:
-                self.estado.erro(d["Id"], numero, e)
+                self.estado.erro(d["Id"], numero, e, _data(d.get("Data")))
                 log.warning("%s: %s", numero, e)
+                erros += 1
+                continue
+            except Exception as e:  # noqa: BLE001 - dados inesperados (KeyError, TypeError…): este documento fica com erro, os outros seguem
+                self.estado.erro(d["Id"], numero, f"{type(e).__name__}: {e}", _data(d.get("Data")))
+                log.exception("%s: erro inesperado ao preparar ou enviar o documento", numero)
                 erros += 1
                 continue
             self.estado.marcar(d["Id"], numero, r.get("id"))
@@ -364,10 +468,10 @@ class Sincronizador:
         confirmar que os dados chegam à Lonntra. Não conta como carga completa: o resto segue o horário normal.
         Devolve {"documentos": {"enviados", "erros", "numeros"}, "catalogo": {...}, "erros": [(item, mensagem)]}."""
         antes = {r[0] for r in self.estado.resumo()[1]}
-        feitos, tentativas = self.estado.enviados(), self.estado.tentativas()
+        feitos, em_espera = self.estado.enviados(), self.estado.em_espera()
         recentes = self.fonte.documentos(list(self.tipos), date.today() - timedelta(days=90)) \
             or self.fonte.documentos(list(self.tipos), None)
-        docs = [d for d in recentes if d["Id"] not in feitos and tentativas.get(d["Id"], 0) < self.max_tentativas][-n:]
+        docs = [d for d in recentes if d["Id"] not in feitos and d["Id"] not in em_espera][-n:]
         enviados, erros, numeros = self._enviar_documentos(docs) if docs else (0, 0, [])
         out = {"documentos": {"enviados": enviados, "erros": erros, "numeros": numeros,
                               "ja_enviados": len([d for d in recentes if d["Id"] in feitos])}}
@@ -429,6 +533,16 @@ def ler_config(caminho):
     if not cfg.read(caminho, encoding="utf-8"):
         sys.exit(f"Não encontrei o ficheiro de configuração {caminho}")
     return cfg
+
+
+def dar_sinal(lonntra, estado, erro_ciclo=None, erro_catalogo=None):
+    """O sinal de vida nunca derruba o sync: qualquer falha (a Lonntra em baixo, uma recusa 422…) fica só no log."""
+    try:
+        lonntra.sinal(estado_do_sync(estado, erro_ciclo, erro_catalogo))
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("Sem sinal para a Lonntra: %s", e)
+        return False
 
 
 def estado_do_sync(estado, erro_ciclo=None, erro_catalogo=None):
@@ -546,7 +660,7 @@ def main(argv=None):
     p.add_argument("--teste", nargs="?", const=10, type=int, metavar="N",
                    help="envia só N (10) documentos, artigos, armazéns, movimentos e existências para confirmar que chegam")
     p.add_argument("--estado", action="store_true", help="mostra o que foi enviado e os erros")
-    p.add_argument("--repetir-erros", action="store_true", help="volta a tentar os documentos que esgotaram as tentativas")
+    p.add_argument("--repetir-erros", action="store_true", help="volta a tentar já os documentos com erro, sem esperar pela próxima tentativa")
     a = p.parse_args(argv)
     cfg = ler_config(a.config)
     s = cfg["sincronizacao"]
@@ -601,10 +715,8 @@ def main(argv=None):
             erro_ciclo = f"{type(e).__name__}: {e}"[:300]
             log.exception("Erro no ciclo; volto a ligar ao SQL Server e tento outra vez daqui a %ds.", intervalo)
             sinc = None
-        try:
-            lonntra.sinal(estado_do_sync(estado, erro_ciclo, sinc.erro_catalogo if sinc else None))
-        except ErroLigacao as e:
-            log.warning("Sem sinal para a Lonntra: %s", e)
+        dar_sinal(lonntra, estado, erro_ciclo, sinc.erro_catalogo if sinc else None)
+        estado.copia_diaria()
         if a.uma_vez:
             return
         time.sleep(intervalo)

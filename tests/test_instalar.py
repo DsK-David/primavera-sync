@@ -158,3 +158,19 @@ class NomeEMoedaTest(unittest.TestCase):
         self.assertEqual(instalar.sugerir_moeda([("EUR", "Euro"), ("ECV", "Escudo cabo-verdiano")]), "ECV")
         self.assertEqual(instalar.sugerir_moeda([("EUR", "Euro"), ("USD", "Dólar")]), "CVE")
         self.assertEqual(instalar.sugerir_moeda([]), "CVE")
+
+
+class SenhaExistenteTest(unittest.TestCase):
+    def test_reaproveita_a_palavra_passe_dos_config_ini_ja_instalados(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raiz = Path(tmp)
+            self.assertIsNone(instalar.senha_existente(raiz))
+            (raiz / "empresas" / "custom").mkdir(parents=True)
+            (raiz / "empresas" / "custom" / "config.ini").write_text(
+                "[primavera]\nligacao = DRIVER={ODBC Driver 17 for SQL Server};SERVER=S;DATABASE=PRIX;UID=lonntra_leitura;"
+                "PWD=abc-DEF_123aA9;TrustServerCertificate=yes\n", encoding="utf-8")
+            self.assertEqual(instalar.senha_existente(raiz), "abc-DEF_123aA9")
+            (raiz / "config.ini").write_text("[primavera]\nligacao = DRIVER={SQL Server};SERVER=.;DATABASE=P;"
+                                             "Trusted_Connection=yes\n", encoding="utf-8")
+            self.assertEqual(instalar.senha_existente(raiz), "abc-DEF_123aA9", "config sem login SQL não conta")
+

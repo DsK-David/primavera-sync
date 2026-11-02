@@ -74,13 +74,20 @@ Ok ("drivers ODBC: " + ($drivers -join ", "))
 
 # ---------------------------------------------------------------- 3. assistente
 $antes = Get-ScheduledTask -TaskName "$Prefixo*" -ErrorAction SilentlyContinue
+$aCorrer = @($antes | Where-Object { $_.State -eq "Running" } | ForEach-Object { $_.TaskName })
 if ($antes) { $antes | Stop-ScheduledTask -ErrorAction SilentlyContinue; Aviso "as tarefas que já existiam foram paradas para reconfigurar" }
 Remove-Item "$Destino\instalacao.json" -ErrorAction SilentlyContinue
 Push-Location $Destino
 & $Py -m primavera_sync.instalar
 $resultado = $LASTEXITCODE
 Pop-Location
-if ($resultado -ne 0) { Falha "a configuração não ficou completa (ver acima e $Destino\relatorio-instalacao.txt). Corrija e corra o instalar.bat outra vez." }
+if ($resultado -eq 1 -or -not (Test-Path "$Destino\instalacao.json")) {
+    # a configuração não ficou escrita: as tarefas que já corriam voltam a correr, para o sync não ficar parado
+    foreach ($nome in $aCorrer) { Start-ScheduledTask -TaskName $nome -ErrorAction SilentlyContinue }
+    if ($aCorrer) { Aviso "as tarefas que já corriam foram retomadas: $($aCorrer -join ', ')" }
+    Falha "a configuração não ficou completa (ver acima e $Destino\relatorio-instalacao.txt). Corrija e corra o instalar.bat outra vez."
+}
+if ($resultado -ne 0) { Aviso "alguma empresa teve erros na verificação ou no teste de envio (ver acima). As tarefas arrancam na mesma: o sync repete e avisa a Lonntra. Confirme em $Destino\relatorio-instalacao.txt." }
 $empresas = @(Get-Content "$Destino\instalacao.json" -Raw -Encoding UTF8 | ConvertFrom-Json)
 
 # ---------------------------------------------------------------- 4. arranque automático (uma tarefa por empresa)
