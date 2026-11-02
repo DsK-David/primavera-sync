@@ -98,6 +98,42 @@ Se o resultado for grande, copiar só as primeiras 100 linhas.
 
 **Passo 5. Decidir:** o sync envia só os recebimentos novos a cada ciclo, ou também reconcilia, uma vez por dia, o saldo de todas as faturas ainda em aberto? (Recomendado: as duas coisas.)
 
+**Passo 6. A Auto Style guarda os recebimentos numa tabela própria (`CNO_recibimento`).** O prefixo `CNO` não é do Primavera padrão: é uma tabela criada à medida da empresa, por isso o sync **não a descobre sozinho** e é preciso conhecer a estrutura dela. Correr na base da empresa (`USE PRI<empresa>;`) e guardar o resultado de cada consulta (nos exemplos, trocar pelo nome certo se a tabela se chamar de outra maneira):
+
+```sql
+-- 6.1 o nome exato da tabela e quantas linhas tem
+SELECT t.name AS tabela, SUM(p.rows) AS linhas
+FROM sys.tables t JOIN sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0, 1)
+WHERE t.name LIKE 'CNO%'
+GROUP BY t.name ORDER BY t.name;
+
+-- 6.2 as colunas dela
+SELECT c.column_id AS n, c.name AS coluna, ty.name AS tipo, c.max_length, c.is_nullable
+FROM sys.columns c JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+WHERE c.object_id = OBJECT_ID('CNO_recibimento')
+ORDER BY c.column_id;
+
+-- 6.3 para onde aponta (chaves ligadas a outras tabelas: como se liga à fatura)
+SELECT OBJECT_NAME(fk.parent_object_id) AS tabela, COL_NAME(fkc.parent_object_id, fkc.parent_column_id) AS coluna,
+       OBJECT_NAME(fk.referenced_object_id) AS refere, COL_NAME(fkc.referenced_object_id, fkc.referenced_column_id) AS coluna_ref
+FROM sys.foreign_keys fk JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
+WHERE OBJECT_NAME(fk.parent_object_id) LIKE 'CNO%' OR OBJECT_NAME(fk.referenced_object_id) LIKE 'CNO%';
+
+-- 6.4 as últimas 15 linhas reais (tapar nomes de clientes, se for preciso)
+SELECT TOP 15 * FROM CNO_recibimento ORDER BY 1 DESC;
+```
+
+**6.5 Um caso concreto:** o número de uma fatura que foi paga depois (por exemplo `FA 2026/12`) e a linha que a representa nessa tabela.
+
+O que se quer perceber com isto:
+
+- que coluna **liga o recebimento à fatura** (número, série ou o `IdCabecDoc`);
+- o **valor**, a **data** e o **método de pagamento** do recebimento;
+- se guarda recebimentos **parciais** (vários por fatura), e se tem **anulados** ou estados;
+- se a tabela vem de uma aplicação própria da empresa, caso em que pode não ter relação com o Primavera padrão.
+
+Como é uma tabela da empresa, a leitura dela fica numa consulta própria no `config.ini` (chave `recebimentos` da secção `[consultas]`), que tem de devolver sempre estas colunas: `Id` (identificador único do recebimento), `IdCabecDoc` (o `Id` do documento no Primavera), `Data`, `Valor`, `ModoPag` e `Numero` (o do recibo). O resto do sync (envio, repetição, avisos) é o mesmo.
+
 Com isto escreve-se a leitura dos recebimentos no `evolution.py` (que, como o resto, se adapta aos nomes de tabela e coluna da base) e o envio para a rota da Lonntra.
 
 ## Protótipo SAF-T
