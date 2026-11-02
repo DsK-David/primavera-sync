@@ -53,7 +53,19 @@ Outras opções: `--completo` revê todos os documentos, não só os dos último
 
 Para o sync enviar os recibos é preciso saber em que tabelas do Primavera da empresa ficam as **liquidações** (recibos) e o **saldo pendente** de cada documento. Os nomes mudam com a versão, por isso não se adivinham: errar aqui marcava faturas como pagas sem o estarem.
 
-**1. No SQL Server Management Studio, na base da empresa** (`USE PRI<empresa>;`), correr e guardar o resultado (tabela e colunas):
+Correr tudo isto no **SQL Server Management Studio, na base da empresa** (`USE PRI<empresa>;`) e guardar o resultado de cada passo.
+
+**Passo 1. Confirmar que se está na base certa** (se a consulta dos recibos der 0 resultados, é quase sempre porque se estava na `master` ou na `PRIEMPRE`):
+
+```sql
+SELECT DB_NAME() AS base;
+SELECT COUNT(*) AS tabelas FROM sys.tables;
+SELECT name FROM sys.tables WHERE name IN ('CabecDoc','LinhasDoc','Clientes','Artigo');
+```
+
+Na base certa devolve o nome da empresa (`PRI…`), umas centenas de tabelas e as quatro da lista. Se não trouxer a `CabecDoc`, trocar com `USE PRI<código da empresa>;`.
+
+**Passo 2. Procurar as tabelas dos recibos pelo nome:**
 
 ```sql
 SELECT t.name AS tabela, c.name AS coluna
@@ -62,9 +74,29 @@ WHERE t.name LIKE '%Liq%' OR t.name LIKE '%Pend%' OR t.name LIKE '%Receb%' OR t.
 ORDER BY t.name, c.column_id;
 ```
 
-**2. Um exemplo real:** o número de uma fatura que foi paga depois (por exemplo `FA 2026/12`) e o do recibo dela (por exemplo `RE 2026/3`). Serve para conferir que o que o sync lê bate certo com o Primavera.
+**Passo 3. Se o passo 2 deu 0 resultados na base certa, procurar mais largo:**
 
-**3. Decidir:** o sync envia só os recebimentos novos a cada ciclo, ou também reconcilia, uma vez por dia, o saldo de todas as faturas ainda em aberto? (Recomendado: as duas coisas.)
+```sql
+-- por nome de tabela
+SELECT name FROM sys.tables
+WHERE name LIKE '%Liq%' OR name LIKE '%Pend%' OR name LIKE '%Tesour%' OR name LIKE '%Cobr%'
+   OR name LIKE '%Hist%' OR name LIKE '%Conta%' OR name LIKE '%Pag%' OR name LIKE '%Mov%'
+ORDER BY name;
+
+-- por nome de coluna (o que guarda saldos e liquidações)
+SELECT t.name AS tabela, c.name AS coluna
+FROM sys.tables t JOIN sys.columns c ON c.object_id = t.object_id
+WHERE c.name LIKE '%Pendente%' OR c.name LIKE '%Liquid%' OR c.name LIKE '%Recebid%' OR c.name LIKE '%Pago%'
+ORDER BY t.name, c.name;
+```
+
+Se o resultado for grande, copiar só as primeiras 100 linhas.
+
+**Passo 4. Um exemplo real:** o número de uma fatura que foi paga depois (por exemplo `FA 2026/12`) e o do recibo dela (por exemplo `RE 2026/3`). Serve para conferir que o que o sync lê bate certo com o Primavera.
+
+**Alternativa sem SQL:** no Primavera, em *Vendas → Tabelas → Tipos de documento*, procurar os tipos «Recibo» ou «Liquidação» e anotar o código (por exemplo `RE`). Com ele procura-se onde esses documentos ficam gravados.
+
+**Passo 5. Decidir:** o sync envia só os recebimentos novos a cada ciclo, ou também reconcilia, uma vez por dia, o saldo de todas as faturas ainda em aberto? (Recomendado: as duas coisas.)
 
 Com isto escreve-se a leitura dos recebimentos no `evolution.py` (que, como o resto, se adapta aos nomes de tabela e coluna da base) e o envio para a rota da Lonntra.
 
