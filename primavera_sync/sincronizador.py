@@ -533,7 +533,8 @@ def ler_config(caminho):
     cfg = configparser.ConfigParser(interpolation=None)
     if not cfg.read(caminho, encoding="utf-8"):
         sys.exit(f"Não encontrei o ficheiro de configuração {caminho}")
-    return cfg
+    from .remoto import sobrepor  # a configuração remota (lista branca) sobrepõe-se ao config.ini
+    return sobrepor(cfg, caminho)
 
 
 def escrever_saude(pasta, erro=None, ciclo_ok=True, agora=None):
@@ -555,11 +556,13 @@ def escrever_saude(pasta, erro=None, ciclo_ok=True, agora=None):
         log.warning("Não consegui escrever o saude.json.", exc_info=True)
 
 
-def dar_sinal(lonntra, estado, erro_ciclo=None, erro_catalogo=None):
+def dar_sinal(lonntra, estado, erro_ciclo=None, erro_catalogo=None, extra=None):
     """O sinal de vida nunca derruba o sync: qualquer falha (a Lonntra em baixo, uma recusa 422…) fica só no log.
     Devolve a resposta da Lonntra (que pode trazer uma versão nova do sync para atualizar), ou None."""
     try:
-        return lonntra.sinal(estado_do_sync(estado, erro_ciclo, erro_catalogo)) or {"ok": True}
+        corpo = estado_do_sync(estado, erro_ciclo, erro_catalogo)
+        corpo.update(extra or {})
+        return lonntra.sinal(corpo) or {"ok": True}
     except Exception as e:  # noqa: BLE001
         log.warning("Sem sinal para a Lonntra: %s", e)
         return None
@@ -739,6 +742,22 @@ def main(argv=None):
     intervalo = s.getint("intervalo", 60)
     completo = a.completo
     sinc = None
+
+    from . import remoto
+    erros_ciclo = {"ciclo": None, "catalogo": None}
+
+    def enviar_sinal():
+        return dar_sinal(lonntra, estado, erros_ciclo["ciclo"], erros_ciclo["catalogo"],
+                         {"resultados": remoto.resultados_pendentes(estado)})
+
+    def obter_sinc():
+        nonlocal sinc
+        if sinc is None:
+            sinc = Sincronizador(Evolution.ligar(cfg["primavera"]["ligacao"], consultas), lonntra, estado, cfg)
+        return sinc
+
+    segredos = [cfg["lonntra"].get("chave", "")] + re.findall(r"(?i)PWD=\{?([^;}]+)", cfg["primavera"].get("ligacao", ""))
+    ctx = remoto.Contexto(cfg, a.config, estado, enviar_sinal, obter_sinc, segredos)
     while True:
         erro_ciclo = None
         try:
@@ -753,10 +772,16 @@ def main(argv=None):
             erro_ciclo = f"{type(e).__name__}: {e}"[:300]
             log.exception("Erro no ciclo; volto a ligar ao SQL Server e tento outra vez daqui a %ds.", intervalo)
             sinc = None
-        resposta = dar_sinal(lonntra, estado, erro_ciclo, sinc.erro_catalogo if sinc else None)
+        erros_ciclo["ciclo"], erros_ciclo["catalogo"] = erro_ciclo, (sinc.erro_catalogo if sinc else None)
+        resposta = enviar_sinal()
+        reiniciar = remoto.tratar_remoto(resposta, ctx)  # configuração e comandos da Lonntra (lista branca)
+        completo, ctx.completo = completo or ctx.completo, False
         atualizar(resposta, a.config, lonntra, estado)
         escrever_saude(Path(a.config).resolve().parent, erro_ciclo, ciclo_ok=erro_ciclo is None)
         estado.copia_diaria()
+        if reiniciar:
+            log.info("A reiniciar (%d) para aplicar a configuração ou o comando remoto.", reiniciar)
+            sys.exit(reiniciar)
         if a.uma_vez:
             return
         time.sleep(intervalo)

@@ -439,3 +439,25 @@ ssh lonntra 'cd /var/www/lonntra && sudo -u www-data php yii integracao/versao-p
 Como chega ao cliente: o sinal de vida (de minuto a minuto) traz a oferta. O sync **só aceita** um pacote com o SHA-256 certo, **assinado** por uma chave de `chaves.json`, de série maior do que a que corre; extrai-o sem sair da pasta, compila, importa e corre o `--verificar` com o config real. Só então muda o `atual.txt`, e o launcher reinicia o sync na versão nova. Se a nova não der um ciclo bom em 10 minutos, o launcher volta à anterior.
 
 Canais: as empresas do canal `teste` recebem as versões novas primeiro (`php yii integracao/canal <NIF> teste`); as `estavel`, só depois de `versao-promover`. Para fixar ou recuar uma empresa: `php yii integracao/alvo <NIF> 1.2.0` (`-` volta a seguir o canal). Uma versão que ainda esteja no disco do cliente troca-se sem descarregar.
+
+## Diagnosticar e afinar o sync de casa (comandos e configuração remotos)
+
+Do servidor da Lonntra (`ssh lonntra`, depois `cd /var/www/lonntra`; todos como `sudo -u www-data php yii …`):
+
+```
+integracao/comando 210038381 esquema          # o que o sync percebeu da base (tabelas e colunas usadas, e o que falta)
+integracao/comando 210038381 log 100          # últimas 100 linhas do log (sem palavras-passe nem chaves)
+integracao/comando 210038381 verificar        # testa a ligação ao SQL e as consultas
+integracao/comando 210038381 repetir_erros    # tenta já os documentos que estão à espera
+integracao/comando 210038381 completo         # o próximo ciclo revê todo o histórico
+integracao/comando 210038381 teste 10         # envia 10 de cada tipo e diz o que chegou
+integracao/comando 210038381 reiniciar
+integracao/comandos 210038381                 # os últimos comandos e o estado de cada um
+integracao/comandos 210038381 <id>            # o resultado completo de um deles
+```
+
+O comando chega no próximo sinal de vida (de minuto a minuto; com o servidor fechado, só quando ele ligar) e **expira ao fim de 24 horas**. O sync executa cada comando uma só vez e devolve o resultado no sinal seguinte.
+
+Configuração (o sync reinicia sozinho ao recebê-la): `integracao/config 210038381 intervalo 120`, `integracao/config 210038381 intervalo -` (remove), `integracao/config 210038381` (lista). Só estas chaves: `intervalo` (30–3600 s), `revisao_dias` (1–365), `catalogo` e `movimentos_stock` (sim/não), `historico_horario` (ex.: `18-7`) e `tipos_artigo_servico` (ex.: `0,5`). Ficam no `config.remoto.ini` do cliente e sobrepõem-se ao `config.ini`.
+
+**O que não se muda à distância, de propósito:** a ligação ao SQL, a chave, o endereço, a moeda e as consultas SQL. O sync não confia na Lonntra para o que corre no SQL Server do cliente: uma consulta nova entra numa **versão assinada** (`scripts/publicar.py`). Cada valor e cada comando é validado outra vez no próprio sync.
