@@ -25,7 +25,7 @@ import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from . import __version__
+from . import __version__, recebimentos as receb
 from .lonntra import ErroApi, ErroLigacao, Lonntra
 
 log = logging.getLogger("primavera_sync")
@@ -220,6 +220,7 @@ class Sincronizador:
         self.tipos = {k.upper(): v.strip().upper() for k, v in cfg["tipos_documento"].items()}  # FA = FT
         self.modos = {k.upper(): v.strip() for k, v in cfg["modos_pagamento"].items()} if cfg.has_section("modos_pagamento") else {}
         self.erro_catalogo = None
+        self.erro_recebimentos = None
         self.codigos_servico = set()  # artigos que são serviços (sem stock): preenchido ao enviar o catálogo
         self._servicos_limpos = False
 
@@ -238,7 +239,64 @@ class Sincronizador:
             except Exception as e:  # noqa: BLE001 - ex.: uma consulta de stock que não existe nesta versão do Primavera
                 self.erro_catalogo = f"catálogo/stock: {e}"[:300]
                 log.exception("Catálogo ou stock: erro; os documentos continuam. Ver [consultas] no config.ini.")
-        return self.documentos(completo)
+        resultado = self.documentos(completo)
+        if _txt(self.s.get("recebimentos", "não")).lower() in ("sim", "s", "1", "true", "yes", "on"):
+            try:
+                self.recebimentos(completo)
+                self.erro_recebimentos = None
+            except ErroLigacao:
+                raise
+            except Exception as e:  # noqa: BLE001 - os recebimentos não travam os documentos
+                self.erro_recebimentos = f"recebimentos: {e}"[:300]
+                log.exception("Recebimentos: erro; os documentos continuam.")
+        return resultado
+
+    # ---- recebimentos (ver recebimentos.py)
+
+    def _recebimentos_lidos(self, desde):
+        """(analise ou None, [recebimentos a enviar]). Com a consulta própria da empresa ([consultas] recebimentos) as linhas já
+        vêm prontas; senão casam-se com as faturas enviadas e infere-se o valor."""
+        linhas = self.fonte.recebimentos(desde)
+        if getattr(self.fonte, "recebimentos_prontos", False):
+            return None, [{"id": str(r["Id"]), "documento_id": str(r["IdCabecDoc"]).upper(), "data": receb._data(r["Data"]),
+                           "valor": round(abs(_num(r["Valor"])), 2), "numero": _txt(r.get("Numero")) or None,
+                           "metodo_pagamento": self.modos.get(_txt(r.get("ModoPag")).upper())} for r in linhas if _num(r.get("Valor"))]
+        enviados = list(self.estado.conn.execute("SELECT documento, numero FROM enviados"))
+        analise = receb.analisar(linhas, enviados, self.fonte.totais, self.s.get("moeda", "CVE"),
+                                 self.cfg["recebimentos"].get("formula") if self.cfg.has_section("recebimentos") else None)
+        return analise, (receb.recebimentos_a_enviar(analise) if analise["fiavel"] else [])
+
+    def relatorio_recebimentos(self):
+        """O relatório (sem enviar nada): como os movimentos casam com as faturas e que fórmula do valor bate com os totais."""
+        analise, itens = self._recebimentos_lidos(None)
+        if analise is None:
+            return f"Consulta própria da empresa: {len(itens)} recebimentos prontos a enviar."
+        return receb.formatar(analise) + f"\nRecebimentos que seguiam (um por fatura e data): {len(itens)}"
+
+    def recebimentos(self, completo=False):
+        """Envia os recebimentos novos ou que mudaram. Só envia se o relatório for fiável (ver recebimentos.py)."""
+        desde, carga = self._historico("recebimentos", completo)
+        analise, itens = self._recebimentos_lidos(desde)
+        if analise is not None and not analise["fiavel"]:
+            self.estado.erro("recebimentos:analise", "recebimentos", analise["motivo"])
+            log.warning("Recebimentos não enviados: %s", analise["motivo"])
+            return 0
+        self.estado.limpar_erros(["recebimentos:analise"])
+        feitos, recusados = self.estado.catalogo("recebimento"), self.estado.recusas("recebimento")
+        novos = [i for i in itens if feitos.get(i["id"]) != f"{i['valor']:.2f}" and recusados.get(i["id"]) != self._marca(f"{i['valor']:.2f}")]
+        enviados = 0
+        for parte in _partes(novos):
+            erros = self._erros("recebimento", self.lonntra.recebimentos(parte))
+            aceites = {i["id"]: f"{i['valor']:.2f}" for i in parte if i["id"] not in erros}
+            self.estado.guardar_catalogo("recebimento", aceites)
+            self.estado.esquecer_recusas("recebimento", aceites)
+            self.estado.guardar_recusas("recebimento", {i["id"]: self._marca(f"{i['valor']:.2f}") for i in parte if i["id"] in erros})
+            enviados += len(aceites)
+        if carga:
+            self._carga_feita("recebimentos")
+        if enviados:
+            log.info("Recebimentos: %d enviado(s).", enviados)
+        return enviados
 
     # ---- histórico: a primeira carga é completa, depois só o recente
 
@@ -529,6 +587,11 @@ class Sincronizador:
         }
 
 
+def opcoes_de(cfg):
+    """Opções da empresa para o Evolution: o nome da tabela própria dos recebimentos, se a indicou ([recebimentos] tabela)."""
+    return {"tabela_recebimentos": cfg["recebimentos"].get("tabela", "").strip()} if cfg.has_section("recebimentos") else {}
+
+
 def ler_config(caminho):
     cfg = configparser.ConfigParser(interpolation=None)
     if not cfg.read(caminho, encoding="utf-8"):
@@ -617,7 +680,7 @@ def verificar(cfg):
     print("Primavera (SQL Server)")
     from .evolution import Evolution
     try:
-        fonte = Evolution.ligar(cfg["primavera"]["ligacao"], dict(cfg["consultas"]) if cfg.has_section("consultas") else {})
+        fonte = Evolution.ligar(cfg["primavera"]["ligacao"], dict(cfg["consultas"]) if cfg.has_section("consultas") else {}, opcoes_de(cfg))
         print("  OK   ligação")
     except Exception as e:  # noqa: BLE001
         print(f"  ERRO ligação: {e}")
@@ -698,6 +761,8 @@ def main(argv=None):
     p.add_argument("--completo", action="store_true", help="revê todos os documentos e movimentos, não só os recentes")
     p.add_argument("--esquema", action="store_true",
                    help="mostra o que o sync percebeu da base do Primavera: tabelas e colunas usadas, e o que falta")
+    p.add_argument("--recebimentos", action="store_true",
+                   help="mostra como os recebimentos da empresa casam com as faturas enviadas e que fórmula do valor bate (não envia nada)")
     p.add_argument("--teste", nargs="?", const=10, type=int, metavar="N",
                    help="envia só N (10) documentos, artigos, armazéns, movimentos e existências para confirmar que chegam")
     p.add_argument("--estado", action="store_true", help="mostra o que foi enviado e os erros")
@@ -733,11 +798,14 @@ def main(argv=None):
     lonntra = Lonntra(cfg["lonntra"]["url"], cfg["lonntra"]["chave"])
     from .evolution import Evolution
     consultas = dict(cfg["consultas"]) if cfg.has_section("consultas") else {}
+    if a.recebimentos:
+        print(Sincronizador(Evolution.ligar(cfg["primavera"]["ligacao"], consultas, opcoes_de(cfg)), lonntra, estado, cfg).relatorio_recebimentos())
+        return
     if a.esquema:
-        print(Evolution.ligar(cfg["primavera"]["ligacao"], consultas).relatorio())
+        print(Evolution.ligar(cfg["primavera"]["ligacao"], consultas, opcoes_de(cfg)).relatorio())
         return
     if a.teste:
-        sys.exit(0 if imprimir_teste(Sincronizador(Evolution.ligar(cfg["primavera"]["ligacao"], consultas), lonntra, estado, cfg)
+        sys.exit(0 if imprimir_teste(Sincronizador(Evolution.ligar(cfg["primavera"]["ligacao"], consultas, opcoes_de(cfg)), lonntra, estado, cfg)
                                      .amostra(a.teste), a.teste) else 1)
     intervalo = s.getint("intervalo", 60)
     completo = a.completo
@@ -753,7 +821,7 @@ def main(argv=None):
     def obter_sinc():
         nonlocal sinc
         if sinc is None:
-            sinc = Sincronizador(Evolution.ligar(cfg["primavera"]["ligacao"], consultas), lonntra, estado, cfg)
+            sinc = Sincronizador(Evolution.ligar(cfg["primavera"]["ligacao"], consultas, opcoes_de(cfg)), lonntra, estado, cfg)
         return sinc
 
     segredos = [cfg["lonntra"].get("chave", "")] + re.findall(r"(?i)PWD=\{?([^;}]+)", cfg["primavera"].get("ligacao", ""))
@@ -762,7 +830,7 @@ def main(argv=None):
         erro_ciclo = None
         try:
             if sinc is None:  # a primeira vez, e depois de a ligação ao SQL Server cair
-                sinc = Sincronizador(Evolution.ligar(cfg["primavera"]["ligacao"], consultas), lonntra, estado, cfg)
+                sinc = Sincronizador(Evolution.ligar(cfg["primavera"]["ligacao"], consultas, opcoes_de(cfg)), lonntra, estado, cfg)
             sinc.ciclo(completo=completo)
             completo = False
         except ErroLigacao as e:
@@ -772,7 +840,7 @@ def main(argv=None):
             erro_ciclo = f"{type(e).__name__}: {e}"[:300]
             log.exception("Erro no ciclo; volto a ligar ao SQL Server e tento outra vez daqui a %ds.", intervalo)
             sinc = None
-        erros_ciclo["ciclo"], erros_ciclo["catalogo"] = erro_ciclo, (sinc.erro_catalogo if sinc else None)
+        erros_ciclo["ciclo"], erros_ciclo["catalogo"] = erro_ciclo, ((sinc.erro_catalogo or sinc.erro_recebimentos) if sinc else None)
         resposta = enviar_sinal()
         reiniciar = remoto.tratar_remoto(resposta, ctx)  # configuração e comandos da Lonntra (lista branca)
         completo, ctx.completo = completo or ctx.completo, False

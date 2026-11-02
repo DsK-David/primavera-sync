@@ -45,9 +45,38 @@ Outras opções: `--completo` revê todos os documentos, não só os dos último
 
 ### Ainda não
 
-- **Recibos** (liquidações de faturas a crédito): a Lonntra **já recebe** recebimentos (`POST /integracao/primavera/recebimento`), mas o sync ainda não os lê no Primavera. Até lá, uma fatura a crédito paga depois fica «por pagar» e «vencida» na Lonntra. O que falta para o fazer está em «Recebimentos: o que falta descobrir», abaixo.
+- **Recibos** (liquidações de faturas a crédito): o sync já sabe lê-los da tabela dos recebimentos da empresa e enviá-los à Lonntra (ver «Recebimentos» abaixo), mas vem **desligado**: primeiro vê-se o relatório e só depois se liga.
 - O tipo de cliente (coletivo/singular) sai do nome («Lda», «S.A.»…). Confirmar com a empresa.
 - Os nomes das tabelas e colunas do Primavera (`evolution.py`) são os da v10 e ainda não foram confirmados num servidor real.
+
+### Recebimentos (como se liga)
+
+A Auto Style guarda os recebimentos numa tabela própria (`CNO_recibimento`: `NumeroDoc`, `Entidade`, `ValorLiquido`, `ValorIva`, `ValorRetencao`, `ValorSelo`, `Recibido`, `DataRecebimento`…). Como não há uma regra publicada de como o `NumeroDoc` se liga à fatura, nem de que valores somam o total recebido, o sync **não as supõe: infere-as dos dados e confere-as**, e só envia se os números baterem.
+
+1. **Casar:** liga o `NumeroDoc` às faturas já enviadas à Lonntra, tentando por esta ordem o número completo (`FA 2026/12`), série/número, tipo+número e só o número (este só se for único). Ignora zeros à esquerda, espaços e maiúsculas. Chaves que servem mais de uma fatura nunca se usam.
+2. **Valor:** testa líquido+IVA, menos retenção, mais selo e só líquido contra o `TotalDocumento` das faturas casadas, e fica com a que bate certo na maioria.
+3. **Só envia se for fiável:** pelo menos 80 % dos movimentos casados e 70 % das faturas com o valor a bater. Senão diz porquê (no `--estado`, no log e no aviso à Lonntra) e não envia nada.
+4. **Envia** um recebimento por fatura e data (a soma das linhas), com um id estável: reenviar com outro valor atualiza, não duplica. A Lonntra acerta a fatura (paga, parcial ou por pagar).
+
+**Ver o relatório antes de ligar** (não envia nada):
+
+```
+python -m primavera_sync.sincronizador empresas\<empresa>\config.ini --recebimentos
+```
+
+ou de casa, na Lonntra: `php yii integracao/comando <NIF> recebimentos` e depois `php yii integracao/comandos <NIF> <id>`.
+
+Quando o relatório disser **PRONTO PARA ENVIAR** e os exemplos fizerem sentido, ligar no `config.ini` (`[sincronizacao] recebimentos = sim`) ou de casa: `php yii integracao/config <NIF> recebimentos sim`.
+
+Opcional, no `config.ini`:
+
+```ini
+[recebimentos]
+tabela = CNO_recibimento      # se o nome for outro, ou houver mais de uma tabela parecida
+formula = liquido+iva         # fixa a fórmula do valor (liquido+iva, liquido+iva-retencao, liquido+iva+selo, liquido)
+```
+
+Se a conta não bater de nenhuma forma, a empresa pode escrever a sua própria consulta em `[consultas] recebimentos`, que tem de devolver sempre `Id`, `IdCabecDoc` (o `Id` do documento no Primavera), `Data`, `Valor`, `ModoPag` e `Numero`; nesse caso o sync não casa nem infere nada, usa-a tal e qual.
 
 ### Recebimentos: o que falta descobrir
 

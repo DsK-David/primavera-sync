@@ -69,6 +69,7 @@ PERMITIDAS = {
     "revisao_dias": _inteiro(1, 365),
     "catalogo": _sim_nao,
     "movimentos_stock": _sim_nao,
+    "recebimentos": _sim_nao,
     "historico_horario": _horario,
     "tipos_artigo_servico": _codigos,
 }
@@ -141,7 +142,7 @@ def _argumento_inteiro(args, padrao, minimo, maximo):
     return n
 
 
-COMANDOS = {"esquema": None, "verificar": None, "log": (50, 1, 500), "repetir_erros": None, "completo": None,
+COMANDOS = {"esquema": None, "recebimentos": None, "verificar": None, "log": (50, 1, 500), "repetir_erros": None, "completo": None,
             "teste": (10, 1, 50), "reiniciar": None}
 
 
@@ -184,6 +185,8 @@ def _executar(comando, args, ctx):
     from . import sincronizador as sinc_mod
     if comando == "esquema":
         return ctx.obter_sinc().fonte.relatorio()
+    if comando == "recebimentos":
+        return ctx.obter_sinc().relatorio_recebimentos()
     if comando == "verificar":
         saida = io.StringIO()
         with contextlib.redirect_stdout(saida):

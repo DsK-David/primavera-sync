@@ -257,10 +257,62 @@ def catalogo(e):
     return Consulta(f"SELECT {', '.join(sel)} FROM [{t.esquema}].[{t.nome}] a {' '.join(juntar)}")
 
 
+def totais(e):
+    """O total de cada documento, para conferir os recebimentos."""
+    t = e.exigir("cabeçalhos de documentos", ["CabecDoc"])
+    sel, faltam, m = e.selecionar(t, "c", [("Id", ["Id", "IdCabecDoc", "IdDoc"], True),
+                                           ("TotalDocumento", ["TotalDocumento", "TotalDoc", "TotalGeral", "Total"], True)])
+    e._faltam(t, faltam)
+    return Consulta(f"SELECT {', '.join(sel)} FROM [{t.esquema}].[{t.nome}] c WHERE c.[{m['Id']}] IN ({{ids}})")
+
+
+# colunas da tabela dos recebimentos (na Auto Style é própria da empresa, CNO_recibimento: movimentos com o indicador
+# «Recibido» e a «DataRecebimento»); papel => nomes possíveis
+RECEBIMENTOS = {
+    "id": ["IDMovimento", "IdMov", "Id"],
+    "documento": ["NumeroDoc", "NumDoc", "Documento"],
+    "entidade": ["Entidade", "Cliente"],
+    "recebido": ["Recibido", "Recebido"],
+    "data_recebimento": ["DataRecebimento", "DataRecibimento", "DataRecebido"],
+    "data_mov": ["DataMov", "Data"],
+    "moeda": ["Moeda"],
+    "liquido": ["ValorLiquido", "Liquido"],
+    "iva": ["ValorIva", "Iva"],
+    "retencao": ["ValorRetencao", "Retencao"],
+    "selo": ["ValorSelo", "Selo"],
+}
+RECEBIMENTOS_OBRIGATORIOS = ("documento", "recebido", "data_recebimento", "liquido")
+RECEBIDO_SIM = "('1','-1','S','s','Y','y','True','true','Sim','sim')"
+
+
+def recebimentos(e, nome_tabela=None):
+    """Os movimentos já recebidos: procura a tabela pelas colunas (ou pelo nome, se a empresa o indicar em
+    [recebimentos] tabela). O `{filtro_data}` filtra pela data do recebimento."""
+    achadas = []
+    for t in e.tabelas:
+        if nome_tabela and _norm(t.nome) != _norm(nome_tabela):
+            continue
+        m = {papel: e.coluna(t, candidatos) for papel, candidatos in RECEBIMENTOS.items()}
+        if all(m[p] for p in RECEBIMENTOS_OBRIGATORIOS):
+            pontos = 50 + (30 if re.search(r"recib|receb", t.nome, re.IGNORECASE) else 0) + 3 * sum(1 for v in m.values() if v)
+            achadas.append((pontos, t, m))
+    if not achadas:
+        onde = f"«{nome_tabela}»" if nome_tabela else "com as colunas NumeroDoc, Recibido, DataRecebimento e ValorLiquido"
+        raise ErroEsquema(f"não encontrei a tabela dos recebimentos {onde} (indique-a em [recebimentos] tabela = … no config.ini)")
+    _, t, m = max(achadas, key=lambda a: a[0])
+    sel = [f"t.[{m[p]}] AS [{p}]" if m[p] else f"NULL AS [{p}]" for p in RECEBIMENTOS]
+    sql = (f"SELECT {', '.join(sel)} FROM [{t.esquema}].[{t.nome}] t "
+           f"WHERE COALESCE(CAST(t.[{m['recebido']}] AS varchar(10)), '') IN {RECEBIDO_SIM} "
+           f"AND t.[{m['data_recebimento']}] IS NOT NULL {{filtro_data}} ORDER BY t.[{m['data_recebimento']}]")
+    e.notas.append(f"recebimentos: uso a tabela {t.nome}")
+    return Consulta(sql, {"filtro_data": f"AND t.[{m['data_recebimento']}] >= ?", "tabela": t.nome})
+
+
 BUILDERS = {
     "documentos": documentos,
     "linhas": linhas,
     "clientes": clientes,
     "artigos_codigos": artigos_codigos,
     "artigos": catalogo,
+    "totais": totais,
 }

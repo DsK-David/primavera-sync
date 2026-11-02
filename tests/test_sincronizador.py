@@ -18,6 +18,13 @@ class FontePrimavera:
         self.docs, self.linhas_, self.clientes_, self.artigos_ = [], {}, {}, {}
         self.catalogo_, self.armazens_, self.existencias_, self.movimentos_ = [], [], [], []
         self.desde_movimentos = None
+        self.recebimentos_, self.totais_, self.recebimentos_prontos = [], {}, False
+
+    def recebimentos(self, desde=None):
+        return [r for r in self.recebimentos_ if desde is None or str(r.get("data_recebimento") or r.get("Data"))[:10] >= desde.isoformat()]
+
+    def totais(self, ids):
+        return {i: self.totais_[i] for i in ids if i in self.totais_}
 
     def catalogo(self, moeda):
         return self.catalogo_
@@ -50,6 +57,12 @@ class LonntraFalsa:
         self.pedidos, self.ids = [], set()
         self.em_baixo = False
         self.pedidos_artigos, self.pedidos_stock = [], []
+        self.pedidos_recebimentos, self.recusar_recebimentos = [], {}
+
+    def recebimentos(self, lista):
+        self.pedidos_recebimentos.append(list(lista))
+        erros = [{"codigo": r["id"], "erro": self.recusar_recebimentos[r["id"]]} for r in lista if r["id"] in self.recusar_recebimentos]
+        return {"recebimentos": len(lista) - len(erros), "erros": erros}
 
     def artigos(self, artigos):
         self.pedidos_artigos.append(artigos)

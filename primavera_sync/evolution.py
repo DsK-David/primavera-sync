@@ -5,6 +5,7 @@ nome não pára o sync. As consultas abaixo são a reserva, se a estrutura da ba
 escrita à mão em [consultas] do config.ini tem sempre prioridade.
 """
 import logging
+from datetime import date
 
 from . import descobrir, esquema
 from .esquema import Consulta, Esquema, ErroEsquema
@@ -82,10 +83,11 @@ RESERVA = {
     "linhas": Consulta(LINHAS_SQL),
     "clientes": Consulta(CLIENTES_SQL),
     "artigos_codigos": Consulta(ARTIGOS_SQL),
+    "totais": Consulta("SELECT Id, TotalDocumento FROM CabecDoc WHERE Id IN ({ids})"),
     **{k: Consulta(v) for k, v in CATALOGO_SQL.items()},
 }
 STOCK = ("armazens", "existencias", "movimentos")
-ORDEM = ("documentos", "linhas", "clientes", "artigos_codigos", "artigos", *STOCK)
+ORDEM = ("documentos", "linhas", "clientes", "artigos_codigos", "artigos", *STOCK, "totais", "recebimentos")
 
 
 def estrutura_mudou(erro):
@@ -99,7 +101,8 @@ def estrutura_mudou(erro):
 class Evolution:
     """Fonte de dados: uma ligação pyodbc à base da empresa (ex.: PRIAUTOSTYLE)."""
 
-    def __init__(self, ligacao, consultas=None):
+    def __init__(self, ligacao, consultas=None, opcoes=None):
+        self.opcoes = dict(opcoes or {})  # ex.: tabela_recebimentos (o nome da tabela própria da empresa)
         self.conn = ligacao
         self.manuais = {k: v for k, v in (consultas or {}).items() if v.strip()}
         self.esquema = None
@@ -108,13 +111,13 @@ class Evolution:
         self._carregar()
 
     @classmethod
-    def ligar(cls, connection_string, consultas=None):
+    def ligar(cls, connection_string, consultas=None, opcoes=None):
         import pyodbc  # só é preciso no servidor do cliente
         conn = pyodbc.connect(connection_string, autocommit=True, readonly=True)
         # o Primavera tem sempre prioridade: num conflito de bloqueios perde o sync, e o sync não espera mais de 5 s
         # por uma tabela ocupada (desiste e tenta no ciclo seguinte)
         conn.execute("SET DEADLOCK_PRIORITY LOW; SET LOCK_TIMEOUT 5000;")
-        return cls(conn, consultas)
+        return cls(conn, consultas, opcoes)
 
     # ---- estrutura e consultas
 
@@ -137,9 +140,13 @@ class Evolution:
 
     def _construir(self, papel):
         if self.esquema is None:
+            if papel not in RESERVA:
+                raise ErroEsquema(f"sem a estrutura da base não sei montar a consulta de {papel}")
             return RESERVA[papel]
         antes = len(self.esquema.notas)
-        if papel in esquema.BUILDERS:
+        if papel == "recebimentos":
+            c = esquema.recebimentos(self.esquema, getattr(self, "opcoes", {}).get("tabela_recebimentos"))
+        elif papel in esquema.BUILDERS:
             c = esquema.BUILDERS[papel](self.esquema)
         else:
             c = self._stock(papel)
@@ -256,3 +263,26 @@ class Evolution:
         for r in rows:
             r["Id"] = str(r["Id"]).upper()
         return rows
+
+    def totais(self, ids):
+        """{Id do documento: total}, para conferir os recebimentos."""
+        out = {}
+        for lote in _lotes(ids):
+            for r in self._rows("totais", lambda c: (c.sql.format(ids=",".join("?" * len(lote))), lote)):
+                out[str(r["Id"]).upper()] = float(r["TotalDocumento"] or 0)
+        return out
+
+    @property
+    def recebimentos_prontos(self):
+        """True se a empresa escreveu a sua própria consulta, que já devolve (Id, IdCabecDoc, Data, Valor, ModoPag, Numero)."""
+        return "recebimentos" in self.manuais
+
+    def recebimentos(self, desde=None):
+        """Os movimentos recebidos desde essa data (pela data do recebimento), em bruto; ou, se a empresa tem a sua consulta em
+        [consultas] recebimentos, os recebimentos já prontos."""
+        def preparar(c):
+            if self.recebimentos_prontos:
+                return c.sql, ([desde or date(1900, 1, 1)] if "?" in c.sql else [])
+            filtro, params = (c.extra.get("filtro_data", ""), [desde]) if desde else ("", [])
+            return c.sql.format(filtro_data=filtro), params
+        return self._rows("recebimentos", preparar)

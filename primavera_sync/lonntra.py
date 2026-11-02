@@ -59,6 +59,10 @@ class Lonntra:
         return self._pedido("POST", "/integracao/primavera/stock",
                             {"armazens": list(armazens), "movimentos": list(movimentos), "existencias": list(existencias)})
 
+    def recebimentos(self, recebimentos):
+        """Recebimentos de faturas já enviadas. Devolve {'recebimentos': n, 'erros': [{'codigo', 'erro'}]}."""
+        return self._pedido("POST", "/integracao/primavera/recebimento", {"recebimentos": list(recebimentos)})
+
     def pacote(self, versao, maximo=8 * 1024 * 1024):
         """Descarrega o zip de uma versão do sync. O endereço é montado aqui, nunca vem da resposta: a chave da empresa só
         vai para a Lonntra. O que se devolve só é de confiança depois de conferido o SHA-256 e a assinatura (atualizador.py)."""
