@@ -35,6 +35,14 @@ ESPERA_RECUSA = 6 * 3600          # uma versão recusada só se volta a tentar p
 LOCK_VELHO = 15 * 60              # um lock com mais disto é de um processo que morreu
 MANTER_VERSOES = 3
 
+# Os testes da versão nova correm com a pasta dela à FRENTE do sys.path: com «python -m» ou «-c» a pasta atual (onde está a cópia do
+# primavera_sync da instalação) vem primeiro e testava-se o código antigo em vez do novo. argv: [pasta do pacote, config…]
+_PRE = "import sys; sys.path.insert(0, sys.argv[1]); "
+IMPORTAR = (_PRE + "import primavera_sync.sincronizador as s, os; "
+            "assert os.path.realpath(s.__file__).startswith(os.path.realpath(sys.argv[1])), 'carregou outra cópia: ' + s.__file__")
+VERIFICAR = (_PRE + "import runpy; sys.argv = ['sincronizador', sys.argv[2], '--verificar']; "
+             "runpy.run_module('primavera_sync.sincronizador', run_name='__main__')")
+
 
 class ErroAtualizacao(Exception):
     """A atualização não se fez; o motivo vai para o log e para a Lonntra. Nada ficou alterado."""
@@ -243,8 +251,8 @@ class Atualizador:
         env = dict(os.environ, PYTHONPATH=str(pasta), PYTHONDONTWRITEBYTECODE="1")
         for descricao, comando in (
                 ("compilar", [sys.executable, "-m", "compileall", "-q", str(pasta / "primavera_sync")]),
-                ("importar", [sys.executable, "-c", "import primavera_sync.sincronizador"]),
-                ("verificar", [sys.executable, "-m", "primavera_sync.sincronizador", self.config, "--verificar"])):
+                ("importar", [sys.executable, "-c", IMPORTAR, str(pasta)]),
+                ("verificar", [sys.executable, "-c", VERIFICAR, str(pasta), self.config])):
             r = self.executar(comando, cwd=str(self.base), env=env, capture_output=True, text=True, timeout=300)
             if r.returncode != 0:
                 saida = (r.stdout + r.stderr).strip()[-300:]

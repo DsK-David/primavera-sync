@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import launcher
 from launcher import Launcher, atraso
@@ -79,7 +80,8 @@ class LauncherTest(unittest.TestCase):
         self.apontar("1.0.0")
         self.l.tick()
         f = self.lancados[0]
-        self.assertEqual(f.cmd[1:4], ["-m", "primavera_sync.sincronizador", str(self.empresa / "config.ini")])
+        self.assertEqual(f.cmd[1], "-c")
+        self.assertEqual(f.cmd[3:], [str(self.base / "versoes" / "1.0.0"), str(self.empresa / "config.ini")])
         self.assertTrue(f.env["PYTHONPATH"].startswith(str(self.base / "versoes" / "1.0.0")))
         self.assertEqual(f.cwd, str(self.base))
 
@@ -242,6 +244,51 @@ class LauncherTest(unittest.TestCase):
         self.l.tick()
         self.assertEqual(self.l.prova["versao"], "1.2.0")
         self.assertEqual(self.l.prova["anterior"], "1.0.0")
+
+
+class VersaoNaPastaCertaTest(unittest.TestCase):
+    """O defeito que só apareceu em campo: a cópia do primavera_sync ao lado do launcher ganhava às versões de versoes\\."""
+
+    def preparar(self, tmp):
+        base = Path(tmp)
+        for pasta, versao in ((base / "primavera_sync", "ANTIGA"), (base / "versoes" / "1.3.0" / "primavera_sync", "NOVA")):
+            pasta.mkdir(parents=True)
+            (pasta / "__init__.py").write_text(f'__version__ = "{versao}"', encoding="utf-8")
+            (pasta / "sincronizador.py").write_text(
+                "import sys\nfrom . import __version__\nprint('A CORRER', __version__, sys.argv[1:])\n", encoding="utf-8")
+        empresa = base / "empresas" / "x"
+        empresa.mkdir(parents=True)
+        (empresa / "config.ini").write_text("[lonntra]\n", encoding="utf-8")
+        (empresa / "atual.txt").write_text("1.3.0", encoding="utf-8")
+        return base, empresa
+
+    def test_o_filho_corre_o_codigo_da_versao_e_nao_a_copia_ao_lado_do_launcher(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base, empresa = self.preparar(tmp)
+            l = Launcher(base, "empresas/x/config.ini", log=lambda t: None, relatar=lambda t: None)
+            r = launcher.subprocess.run(l.comando("1.3.0"), cwd=str(base), env=l.ambiente("1.3.0"), capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("A CORRER NOVA", r.stdout)
+            self.assertNotIn("ANTIGA", r.stdout)
+            self.assertIn(str(empresa / "config.ini"), r.stdout, "o config chega ao sync como argumento")
+
+    def test_a_versao_raiz_continua_a_ser_a_copia_ao_lado(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base, empresa = self.preparar(tmp)
+            (empresa / "atual.txt").write_text("9.9.9", encoding="utf-8")  # não existe: cai na raiz
+            l = Launcher(base, "empresas/x/config.ini", log=lambda t: None, relatar=lambda t: None)
+            self.assertEqual(l.alvo(), launcher.RAIZ)
+            r = launcher.subprocess.run(l.comando(), cwd=str(base), env=l.ambiente(launcher.RAIZ), capture_output=True, text=True, timeout=60)
+            self.assertIn("A CORRER ANTIGA", r.stdout)
+
+    def test_o_autoteste_verifica_a_versao_alvo_e_nao_a_copia_ao_lado(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base, empresa = self.preparar(tmp)
+            (base / "versoes" / "1.3.0" / "primavera_sync" / "sincronizador.py").write_text("__version__ = 'NOVA'", encoding="utf-8")
+            (base / "primavera_sync" / "sincronizador.py").write_text("__version__ = 'ANTIGA'", encoding="utf-8")
+            with mock.patch("builtins.print") as imprime:
+                self.assertEqual(launcher.autoteste(base, empresa / "config.ini"), 0)
+            self.assertIn("sync NOVA", str(imprime.call_args_list))
 
 
 class AutotesteTest(unittest.TestCase):

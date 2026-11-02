@@ -96,7 +96,8 @@ class AtualizadorTest(unittest.TestCase):
         self.assertTrue((self.base / "versoes" / "1.3.0" / "primavera_sync" / "__init__.py").is_file())
         self.assertFalse((self.base / "versoes" / "1.3.0.tmp").exists())
         self.assertEqual(len(self.comandos), 3, "compilar, importar e --verificar")
-        self.assertIn("--verificar", self.comandos[2])
+        self.assertIn("--verificar", self.comandos[2][2], "o --verificar corre com a pasta da versão nova à frente")
+        self.assertEqual(self.comandos[1][3], str(self.base / "versoes" / "1.3.0.tmp"))
         self.assertTrue(all(str(self.base / "versoes" / "1.3.0.tmp") in c[-1] or True for c in self.comandos))
         self.assertEqual(self.estado.resumo()[1], [])
 
@@ -235,6 +236,42 @@ class AtualizadorTest(unittest.TestCase):
             os.environ.pop("PRIMAVERA_LAUNCHER", None)
             (self.base / "chaves.json").write_text('{"chaves": ["x"]}', encoding="utf-8")
             self.assertFalse(Atualizador.disponivel(self.base))
+
+
+@unittest.skipUnless(TEM_CRYPTO, "precisa de «cryptography»")
+class TesteDaVersaoNovaTest(unittest.TestCase):
+    """Defeito de campo: o teste de importação carregava a cópia antiga do primavera_sync (na pasta atual) em vez da nova."""
+
+    def test_o_teste_de_importacao_falha_se_carregar_outra_copia(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "primavera_sync").mkdir()
+            (base / "primavera_sync" / "__init__.py").write_text("", encoding="utf-8")
+            (base / "primavera_sync" / "sincronizador.py").write_text("", encoding="utf-8")
+            nova = base / "versoes" / "1.3.0.tmp"
+            (nova / "primavera_sync").mkdir(parents=True)
+            (nova / "primavera_sync" / "__init__.py").write_text("", encoding="utf-8")
+            (nova / "primavera_sync" / "sincronizador.py").write_text("isto não é python (", encoding="utf-8")
+            r = subprocess.run([sys.executable, "-c", atualizador.IMPORTAR, str(nova)], cwd=str(base), capture_output=True, text=True,
+                               env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+            self.assertNotEqual(r.returncode, 0, "a cópia nova está estragada: o teste tem de a ver (e não a antiga, que está boa)")
+            self.assertIn("SyntaxError", r.stderr)
+
+    def test_o_teste_de_importacao_passa_com_a_copia_nova_boa(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "primavera_sync").mkdir()
+            (base / "primavera_sync" / "__init__.py").write_text("", encoding="utf-8")
+            (base / "primavera_sync" / "sincronizador.py").write_text("isto não é python (", encoding="utf-8")  # a antiga é que está má
+            nova = base / "versoes" / "1.3.0.tmp"
+            (nova / "primavera_sync").mkdir(parents=True)
+            (nova / "primavera_sync" / "__init__.py").write_text("", encoding="utf-8")
+            (nova / "primavera_sync" / "sincronizador.py").write_text("x = 1", encoding="utf-8")
+            r = subprocess.run([sys.executable, "-c", atualizador.IMPORTAR, str(nova)], cwd=str(base), capture_output=True, text=True,
+                               env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+            self.assertEqual(r.returncode, 0, r.stderr)
 
 
 class SemCriptografiaTest(unittest.TestCase):

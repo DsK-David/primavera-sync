@@ -28,6 +28,12 @@ PROVA_SEGUNDOS = 600         # tempo que uma versão nova tem para dar um ciclo 
 PROVA_FALHAS = 3             # ou mortes seguidas que a reprovam
 RAIZ = "raiz"                # «versão» = o primavera_sync ao lado do launcher
 
+# Arranca o sync com a pasta da versão à FRENTE do sys.path. Com «python -m» a pasta atual (onde está a cópia do primavera_sync
+# da instalação) vem antes do PYTHONPATH e ganharia sempre às versões em versoes\: o sync nunca mudava de código.
+# argv: [código, pasta do pacote, config…]
+ARRANQUE = ("import sys, runpy; sys.path.insert(0, sys.argv[1]); sys.argv = ['sincronizador'] + sys.argv[2:]; "
+            "runpy.run_module('primavera_sync.sincronizador', run_name='__main__')")
+
 
 def _ler(caminho, padrao=""):
     try:
@@ -90,8 +96,8 @@ class Launcher:
 
     # ---- arranque do filho
 
-    def comando(self):
-        return [sys.executable, "-m", "primavera_sync.sincronizador", str(self.config)]
+    def comando(self, versao=None):
+        return [sys.executable, "-c", ARRANQUE, str(self.pacote(versao or self.alvo())), str(self.config)]
 
     def ambiente(self, versao):
         env = dict(os.environ, PYTHONUNBUFFERED="1", PRIMAVERA_LAUNCHER="1")  # o sync só se atualiza debaixo do launcher
@@ -101,7 +107,7 @@ class Launcher:
 
     def arrancar(self, versao):
         self.log(f"a arrancar o sync, versão {versao}")
-        self.filho = self.lancar(self.comando(), cwd=str(self.base), env=self.ambiente(versao))
+        self.filho = self.lancar(self.comando(versao), cwd=str(self.base), env=self.ambiente(versao))
         _prender_ao_launcher(self.filho, self.log)
         self.versao_em_execucao = versao
         self.arrancou_em = self.agora()
@@ -297,7 +303,9 @@ def autoteste(base, config=None):
     launcher = Launcher(base, config or base / "config.ini", log=lambda t: None)
     versao = launcher.alvo()
     env = dict(launcher.ambiente(versao), PYTHONDONTWRITEBYTECODE="1")  # a verificação não deixa ficheiros nem aproveita os velhos
-    r = subprocess.run([sys.executable, "-c", "import primavera_sync.sincronizador as s; print(s.__version__)"],
+    codigo = ("import sys; sys.path.insert(0, sys.argv[1]); import primavera_sync.sincronizador as s; "
+              "print(s.__version__)")  # a pasta da versão à frente, como no arranque
+    r = subprocess.run([sys.executable, "-c", codigo, str(launcher.pacote(versao))],
                        cwd=str(base), env=env, capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         print(f"ERRO a importar o sync (versão {versao}): {r.stderr.strip()[-300:]}")
