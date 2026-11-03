@@ -116,6 +116,23 @@ class ExecutarTest(unittest.TestCase):
         self.assertNotIn("SegredoDoSql", texto)
         self.assertNotIn("ChaveDaLonntra", texto)
 
+    def test_reenviar_so_aceita_um_documento(self):
+        self.assertEqual(validar_comando("reenviar", " FP  2025/1 "), "FP 2025/1")
+        for mau in ("", "FP", "fp 2025/1", "FP 2025/1; DROP", "FP 2025/1 FP 2025/2", "../x", "FP 2025/"):
+            with self.assertRaises(ValueError):
+                validar_comando("reenviar", mau)
+
+    def test_reenviar_chama_o_sincronizador(self):
+        class Sinc:
+            pedido = None
+
+            def reenviar_documento(self, numero):
+                Sinc.pedido = numero
+                return "feito"
+        ctx = contexto(self.tmp.name, sinc=Sinc())
+        self.assertEqual(executar_comando({"comando": "reenviar", "args": "FP 2025/1"}, ctx), ("ok", "feito"))
+        self.assertEqual(Sinc.pedido, "FP 2025/1")
+
     def test_comando_desconhecido_ou_mau_da_erro_sem_levantar(self):
         for cmd in ({"comando": "apagar"}, {"comando": "log", "args": "999999"}, {}):
             with self.assertLogs("primavera_sync", level="ERROR"):

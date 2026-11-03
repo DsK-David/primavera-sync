@@ -224,6 +224,7 @@ class Sincronizador:
         self.pulso = None  # função chamada entre lotes, para dar sinal e tratar comandos dentro de um ciclo longo (ver main)
         self.codigos_servico = set()  # artigos que são serviços (sem stock): preenchido ao enviar o catálogo
         self._servicos_limpos = False
+        self._movimentos_limpos = False
 
     def _pulsar(self):
         """Dentro de um ciclo longo (a carga do histórico demora horas) continua a dar sinal e a tratar os comandos remotos."""
@@ -424,8 +425,11 @@ class Sincronizador:
         feitos = self.estado.catalogo("movimento")
         recusados = self.estado.recusas("movimento")
         desde, carga = self._historico("movimentos", completo)
-        movimentos = []
+        movimentos, de_servicos = [], []
         for m in (self.fonte.movimentos(desde or date(1900, 1, 1)) if movimentos_ativos else []):
+            if _txt(m.get("Artigo")) in self.codigos_servico:  # serviço não tem stock: a Lonntra recusa-o (como as existências)
+                de_servicos.append(m["Id"])
+                continue
             if m["Id"] in feitos or _num(m.get("Quantidade")) == 0 or recusados.get(m["Id"]) == self._marca(""):
                 continue
             tipo = _txt(m.get("EntradaSaida")).upper()[:1]
@@ -434,6 +438,10 @@ class Sincronizador:
             movimentos.append({"id": m["Id"], "artigo": _txt(m["Artigo"]), "armazem": _txt(m.get("Armazem")),
                                "data": _data(m["Data"]), "tipo": tipo, "quantidade": abs(_num(m["Quantidade"])),
                                "documento": _txt(m.get("Documento")) or None})
+        if de_servicos and not self._movimentos_limpos:  # recusas e erros de antes (quando ainda se enviavam)
+            self.estado.esquecer_recusas("movimento", de_servicos)
+            self.estado.limpar_erros([f"movimento:{i}" for i in de_servicos])
+            self._movimentos_limpos = True
         if limite:  # os mais recentes
             movimentos = sorted(movimentos, key=lambda m: m["data"] or "")[-limite:]
         for parte in _partes(movimentos):
@@ -505,6 +513,23 @@ class Sincronizador:
             self._carga_feita("documentos")
         log.info("Ciclo terminado: %d enviado(s), %d com erro.", enviados, erros)
         return {"documentos": enviados, "erros": erros}
+
+    def reenviar_documento(self, numero):
+        """Reenvia UM documento («FP 2025/1») mesmo que o estado local o dê como enviado (a Lonntra não o tem). Devolve o resultado em texto."""
+        tipo, resto = numero.split(" ", 1)
+        serie, num = resto.split("/", 1)
+        alvo = [d for d in self.fonte.documentos([tipo], date(1900, 1, 1))
+                if _txt(d["Serie"]) == serie and _txt(d["NumDoc"]) == num]
+        if not alvo:
+            return f"«{numero}» não existe no Primavera (ou está anulado ou não é de cliente): nada a reenviar."
+        d = alvo[0]
+        with self.estado.conn:
+            self.estado.conn.execute("DELETE FROM enviados WHERE documento=?", (d["Id"],))
+        enviados, erros, _ = self._enviar_documentos([d])
+        if enviados:
+            return f"«{numero}» reenviado: a Lonntra aceitou."
+        motivo = self.estado.conn.execute("SELECT mensagem FROM erros WHERE documento=?", (d["Id"],)).fetchone()
+        return f"«{numero}» NÃO foi aceite: {motivo[0] if motivo else 'sem detalhe'}"
 
     def _desde_com_erros(self, desde):
         """A janela de revisão alarga-se até ao documento com erro mais antigo: um documento recusado e corrigido depois

@@ -118,6 +118,18 @@ class SincronizadorTest(unittest.TestCase):
         self.estado.conn.close()
         self.tmp.cleanup()
 
+    def test_reenviar_um_documento_que_o_estado_da_como_enviado(self):
+        self.fonte.docs = [doc("A", "FA", 1, 2500), doc("B", "FA", 2, 900)]
+        self.fonte.linhas_ = {"A": [linha("A", "MO", 1, 2500)], "B": [linha("B", "MO", 1, 900)]}
+        self.s.ciclo()
+        self.api.ids.clear()  # a Lonntra perdeu-os (ou nunca os guardou)
+        n = len(self.api.pedidos)
+        texto = self.s.reenviar_documento("FA 2026/1")
+        self.assertIn("reenviado", texto)
+        self.assertEqual(len(self.api.pedidos), n + 1, "só esse documento")
+        self.assertIn("A", self.estado.enviados())
+        self.assertIn("não existe", self.s.reenviar_documento("FA 2026/99"))
+
     def test_envia_o_documento_completo_uma_so_vez(self):
         self.fonte.docs = [doc("A", "FA", 1, 21275)]
         self.fonte.linhas_ = {"A": [linha("A", "PNEU", 2, 16000), linha("A", "MO", 1, 2500)]}
@@ -312,6 +324,18 @@ class CatalogoTest(unittest.TestCase):
         enviadas = [e["artigo"] for p in self.api.pedidos_stock for e in p["existencias"]]
         self.assertNotIn("MO", enviadas)
         self.assertEqual(self.estado.resumo()[1], [], "o erro antigo desaparece")
+
+    def test_movimentos_de_servicos_nao_se_enviam_e_limpam_recusas_antigas(self):
+        self.s.codigos_servico = {"MO"}
+        self.fonte.movimentos_.append({"Id": "M3", "Artigo": "MO", "Armazem": "A1", "Data": date(2020, 4, 1), "EntradaSaida": "S",
+                                       "Quantidade": 1, "Documento": "FA 9"})
+        self.estado.erro("movimento:M3", "movimento M3", "«MO» é um serviço: não tem stock")
+        self.estado.guardar_recusas("movimento", {"M3": "x"})
+        self.s._stock(False)
+        enviados = [m["id"] for p in self.api.pedidos_stock for m in p["movimentos"]]
+        self.assertEqual(sorted(enviados), ["M1", "M2"], "o movimento do serviço não segue")
+        self.assertEqual(self.estado.resumo()[1], [], "o erro antigo desaparece")
+        self.assertNotIn("M3", self.estado.recusas("movimento"))
 
     def test_existencia_aceite_depois_apaga_o_erro_dela(self):
         self.fonte.existencias_ = [{"Artigo": "PN195", "Armazem": "A1", "Quantidade": 3}]

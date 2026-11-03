@@ -6,7 +6,7 @@ mas aqui não se confia nela):
 
   configuração: só valores simples (intervalo, dias de revisão, horário do histórico, tipos de serviço, catálogo/movimentos
                 ligados). Nunca ligação, chave, endereço, moeda nem consultas SQL: uma consulta nova entra por uma VERSÃO ASSINADA.
-  comandos:     esquema, verificar, log [n], repetir_erros, completo, teste [n], reiniciar. Nada de texto a executar.
+  comandos:     esquema, verificar, log [n], repetir_erros, completo, reenviar <doc>, teste [n], reiniciar. Nada de texto a executar.
 
 A configuração fica em `config.remoto.ini` ao lado do `config.ini` e sobrepõe-se a ele; um comando executa-se uma só vez
 (os ids ficam no estado.db); os resultados (sem palavras-passe nem chaves, no máximo 20 KB) ficam guardados até a Lonntra
@@ -144,7 +144,7 @@ def _argumento_inteiro(args, padrao, minimo, maximo):
 
 
 COMANDOS = {"esquema": None, "recebimentos": None, "verificar": None, "log": (50, 1, 500), "repetir_erros": None, "completo": None,
-            "teste": (10, 1, 50), "reiniciar": None}
+            "teste": (10, 1, 50), "reiniciar": None, "reenviar": "documento"}
 
 
 def validar_comando(comando, args):
@@ -152,6 +152,11 @@ def validar_comando(comando, args):
     if comando not in COMANDOS:
         raise ValueError(f"comando desconhecido: {comando}")
     regra = COMANDOS[comando]
+    if regra == "documento":  # «FP 2025/1»: tipo, série/número. Nada mais passa
+        texto = " ".join(str(args or "").split())
+        if not re.fullmatch(r"[A-Z][A-Z0-9]{0,5} [A-Za-z0-9]{1,10}/\d{1,9}", texto):
+            raise ValueError("o argumento tem de ser um documento, ex.: FP 2025/1")
+        return texto
     if regra is None:
         if str(args or "").strip():
             raise ValueError(f"«{comando}» não leva argumentos")
@@ -308,6 +313,8 @@ def _executar(comando, args, ctx):
         with ctx.estado.conn:
             n = ctx.estado.conn.execute("UPDATE erros SET ultima='1970-01-01T00:00:00' WHERE documento NOT LIKE '%:%'").rowcount
         return f"{n} documento(s) com erro voltam a ser tentados no próximo ciclo."
+    if comando == "reenviar":
+        return ctx.obter_sinc().reenviar_documento(args)
     if comando == "completo":
         ctx.completo = True
         return "O próximo ciclo revê todo o histórico."
