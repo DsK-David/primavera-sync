@@ -422,6 +422,9 @@ class Sincronizador:
 
         movimentos_ativos = _txt(self.s.get("movimentos_stock", "sim")).lower() not in ("nao", "não", "no", "false", "0", "off")
         feitos = self.estado.catalogo("movimento")
+        if self.estado.marca("recusas_movimentos_servicos") != "1":  # 1.5.x: a Lonntra passou a aceitar movimentos de serviços
+            self.estado.esquecer_recusas("movimento", list(self.estado.recusas("movimento")))
+            self.estado.marcar_marca("recusas_movimentos_servicos", "1")
         recusados = self.estado.recusas("movimento")
         desde, carga = self._historico("movimentos", completo)
         movimentos = []
@@ -594,6 +597,9 @@ class Sincronizador:
         if not linhas:
             raise ValueError("documento sem linhas de artigo")
         c = clientes.get(d["Entidade"])
+        if c is None and _txt(d.get("NomeDoc")):
+            # o cliente já não existe na tabela Clientes (foi apagado): vale o que o próprio documento guardou dele
+            c = {"Nome": d["NomeDoc"], "NumContrib": d.get("NifDoc"), "Fac_Mor": d.get("MoradaDoc"), "Fac_Local": d.get("LocalDoc")}
         if c is None:
             raise ValueError(f"o cliente {d['Entidade']} não existe na tabela Clientes do Primavera")
 

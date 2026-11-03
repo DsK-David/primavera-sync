@@ -118,6 +118,20 @@ class SincronizadorTest(unittest.TestCase):
         self.estado.conn.close()
         self.tmp.cleanup()
 
+    def test_cliente_apagado_usa_os_dados_do_proprio_documento(self):
+        d = {**doc("A", "FA", 1, 2500, cliente="CLI9"), "NomeDoc": "Cliente Indiferenciado", "NifDoc": "000000000", "MoradaDoc": "praia", "LocalDoc": "praia"}
+        self.fonte.docs = [d]
+        self.fonte.linhas_ = {"A": [linha("A", "MO", 1, 2500)]}
+        self.assertEqual(self.s.ciclo(), {"documentos": 1, "erros": 0})
+        cliente = self.api.pedidos[-1]["cliente"]
+        self.assertEqual((cliente["codigo"], cliente["nome"], cliente["nif"]), ("CLI9", "Cliente Indiferenciado", None))
+        self.assertEqual(cliente["morada"], "praia, praia")
+
+    def test_cliente_apagado_sem_dados_no_documento_continua_a_dar_erro(self):
+        self.fonte.docs = [doc("A", "FA", 1, 2500, cliente="CLI9")]
+        self.fonte.linhas_ = {"A": [linha("A", "MO", 1, 2500)]}
+        self.assertEqual(self.s.ciclo(), {"documentos": 0, "erros": 1})
+
     def test_reenviar_um_documento_que_o_estado_da_como_enviado(self):
         self.fonte.docs = [doc("A", "FA", 1, 2500), doc("B", "FA", 2, 900)]
         self.fonte.linhas_ = {"A": [linha("A", "MO", 1, 2500)], "B": [linha("B", "MO", 1, 900)]}
@@ -333,6 +347,13 @@ class CatalogoTest(unittest.TestCase):
         self.s._stock(False)
         enviados = [m["id"] for p in self.api.pedidos_stock for m in p["movimentos"]]
         self.assertEqual(sorted(enviados), ["M1", "M2", "M3"])
+
+    def test_recusas_de_movimentos_de_antes_voltam_a_tentar_se_uma_vez(self):
+        self.estado.guardar_recusas("movimento", {"M1": self.s._marca("")})
+        self.s._stock(False)
+        enviados = [m["id"] for p in self.api.pedidos_stock for m in p["movimentos"]]
+        self.assertIn("M1", enviados, "a recusa antiga não o impede de seguir")
+        self.assertEqual(self.estado.marca("recusas_movimentos_servicos"), "1")
 
     def test_existencia_aceite_depois_apaga_o_erro_dela(self):
         self.fonte.existencias_ = [{"Artigo": "PN195", "Armazem": "A1", "Quantidade": 3}]

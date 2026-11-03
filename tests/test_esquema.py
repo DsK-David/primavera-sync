@@ -6,7 +6,7 @@ from primavera_sync.esquema import ErroEsquema, Esquema
 from primavera_sync.evolution import Evolution, estrutura_mudou
 
 CABEC = ["Id", "TipoDoc", "Serie", "NumDoc", "Data", "DataVenc", "Entidade", "TipoEntidade", "CondPag", "ModoPag",
-         "Moeda", "TotalDocumento", "DescFinanceiro"]
+         "Moeda", "TotalDocumento", "DescFinanceiro", "Nome", "NumContribuinte", "Morada", "Localidade"]
 LINHAS = ["Id", "IdCabecDoc", "NumLinha", "Artigo", "Descricao", "Quantidade", "PrecoLiquido", "TaxaIva", "IdLinhaOrigemCopia"]
 
 

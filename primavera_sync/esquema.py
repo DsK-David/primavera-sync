@@ -114,6 +114,11 @@ def documentos(e):
         ("Moeda", ["Moeda"], False),
         ("TotalDocumento", ["TotalDocumento", "TotalDoc", "TotalGeral", "Total"], True),
         ("DescFinanceiro", ["DescFinanceiro", "DescontoFinanceiro"], False),
+        # os dados do cliente que o próprio documento guarda: servem se o cliente já não existe na tabela Clientes
+        ("NomeDoc", ["Nome"], False),
+        ("NifDoc", ["NumContribuinte"], False),
+        ("MoradaDoc", ["Morada"], False),
+        ("LocalDoc", ["Localidade"], False),
     ])
     e._faltam(t, faltam)
 
