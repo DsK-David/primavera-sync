@@ -325,17 +325,14 @@ class CatalogoTest(unittest.TestCase):
         self.assertNotIn("MO", enviadas)
         self.assertEqual(self.estado.resumo()[1], [], "o erro antigo desaparece")
 
-    def test_movimentos_de_servicos_nao_se_enviam_e_limpam_recusas_antigas(self):
+    def test_movimentos_de_servicos_tambem_se_enviam(self):
+        """O histórico de stock fica igual ao do Primavera: tudo o que existir lá existe na Lonntra (só as existências dos serviços não vão)."""
         self.s.codigos_servico = {"MO"}
         self.fonte.movimentos_.append({"Id": "M3", "Artigo": "MO", "Armazem": "A1", "Data": date(2020, 4, 1), "EntradaSaida": "S",
                                        "Quantidade": 1, "Documento": "FA 9"})
-        self.estado.erro("movimento:M3", "movimento M3", "«MO» é um serviço: não tem stock")
-        self.estado.guardar_recusas("movimento", {"M3": "x"})
         self.s._stock(False)
         enviados = [m["id"] for p in self.api.pedidos_stock for m in p["movimentos"]]
-        self.assertEqual(sorted(enviados), ["M1", "M2"], "o movimento do serviço não segue")
-        self.assertEqual(self.estado.resumo()[1], [], "o erro antigo desaparece")
-        self.assertNotIn("M3", self.estado.recusas("movimento"))
+        self.assertEqual(sorted(enviados), ["M1", "M2", "M3"])
 
     def test_existencia_aceite_depois_apaga_o_erro_dela(self):
         self.fonte.existencias_ = [{"Artigo": "PN195", "Armazem": "A1", "Quantidade": 3}]

@@ -224,7 +224,6 @@ class Sincronizador:
         self.pulso = None  # função chamada entre lotes, para dar sinal e tratar comandos dentro de um ciclo longo (ver main)
         self.codigos_servico = set()  # artigos que são serviços (sem stock): preenchido ao enviar o catálogo
         self._servicos_limpos = False
-        self._movimentos_limpos = False
 
     def _pulsar(self):
         """Dentro de um ciclo longo (a carga do histórico demora horas) continua a dar sinal e a tratar os comandos remotos."""
@@ -425,11 +424,8 @@ class Sincronizador:
         feitos = self.estado.catalogo("movimento")
         recusados = self.estado.recusas("movimento")
         desde, carga = self._historico("movimentos", completo)
-        movimentos, de_servicos = [], []
+        movimentos = []
         for m in (self.fonte.movimentos(desde or date(1900, 1, 1)) if movimentos_ativos else []):
-            if _txt(m.get("Artigo")) in self.codigos_servico:  # serviço não tem stock: a Lonntra recusa-o (como as existências)
-                de_servicos.append(m["Id"])
-                continue
             if m["Id"] in feitos or _num(m.get("Quantidade")) == 0 or recusados.get(m["Id"]) == self._marca(""):
                 continue
             tipo = _txt(m.get("EntradaSaida")).upper()[:1]
@@ -438,10 +434,6 @@ class Sincronizador:
             movimentos.append({"id": m["Id"], "artigo": _txt(m["Artigo"]), "armazem": _txt(m.get("Armazem")),
                                "data": _data(m["Data"]), "tipo": tipo, "quantidade": abs(_num(m["Quantidade"])),
                                "documento": _txt(m.get("Documento")) or None})
-        if de_servicos and not self._movimentos_limpos:  # recusas e erros de antes (quando ainda se enviavam)
-            self.estado.esquecer_recusas("movimento", de_servicos)
-            self.estado.limpar_erros([f"movimento:{i}" for i in de_servicos])
-            self._movimentos_limpos = True
         if limite:  # os mais recentes
             movimentos = sorted(movimentos, key=lambda m: m["data"] or "")[-limite:]
         for parte in _partes(movimentos):
