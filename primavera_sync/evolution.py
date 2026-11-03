@@ -15,7 +15,8 @@ log = logging.getLogger("primavera_sync")
 # Só documentos de cliente; as linhas sem artigo (comentários) não entram.
 DOCUMENTOS_SQL = """
 SELECT c.Id, c.TipoDoc, c.Serie, c.NumDoc, c.Data, c.DataVenc, c.Entidade, c.CondPag, c.ModoPag, c.Moeda,
-       c.TotalDocumento, c.DescFinanceiro, c.Nome AS NomeDoc, c.NumContribuinte AS NifDoc, c.Morada AS MoradaDoc, c.Localidade AS LocalDoc
+       c.TotalDocumento, c.DescFinanceiro, c.Nome AS NomeDoc, c.NumContribuinte AS NifDoc, c.Morada AS MoradaDoc, c.Localidade AS LocalDoc,
+       c.RefTipoDocOrig AS RefTipo, c.RefSerieDocOrig AS RefSerie, c.RefDocOrig AS RefNum
 FROM CabecDoc c
 LEFT JOIN CabecDocStatus s ON s.IdCabecDoc = c.Id
 WHERE c.TipoEntidade = 'C' AND COALESCE(s.Anulado, 0) = 0

@@ -132,6 +132,33 @@ class SincronizadorTest(unittest.TestCase):
         self.fonte.linhas_ = {"A": [linha("A", "MO", 1, 2500)]}
         self.assertEqual(self.s.ciclo(), {"documentos": 0, "erros": 1})
 
+    def test_devolucoes_vao_como_notas_de_devolucao(self):
+        self.assertEqual(self.s.tipos["DEV"], "DV")
+        self.assertEqual(self.s.tipos["DV"], "DV")
+        d = doc("A", "DEV", 1, -2500)
+        self.fonte.docs = [d]
+        self.fonte.linhas_ = {"A": [linha("A", "MO", -1, -2500)]}
+        self.assertEqual(self.s.ciclo(), {"documentos": 1, "erros": 0})
+        corpo = self.api.pedidos[-1]
+        self.assertEqual((corpo["documento"]["tipo"], corpo["documento"]["total"]), ("DV", 2500.0))
+        self.assertEqual(corpo["linhas"][0]["quantidade"], 1.0)
+
+    def test_a_origem_da_nota_vem_do_cabecalho(self):
+        d = {**doc("A", "NC", 1, -2500), "RefTipo": "fa", "RefSerie": "2026", "RefNum": "35"}
+        self.fonte.docs = [d, doc("B", "NC", 2, -900)]
+        self.fonte.linhas_ = {"A": [linha("A", "MO", -1, -2500)], "B": [linha("B", "MO", -1, -900)]}
+        self.s.ciclo()
+        origens = {p["documento"]["numero"]: p["documento"]["origem_numero"] for p in self.api.pedidos}
+        self.assertEqual(origens, {"NC 2026/1": "FA 2026/35", "NC 2026/2": None})
+
+    def test_devolucoes_podem_desligar_se_ou_mapear_se_de_outra_forma(self):
+        from primavera_sync.sincronizador import tipos_de
+        self.cfg["sincronizacao"]["devolucoes"] = "nao"
+        self.assertNotIn("DEV", tipos_de(self.cfg))
+        self.cfg["sincronizacao"]["devolucoes"] = "sim"
+        self.cfg["tipos_documento"]["DEV"] = "NC"
+        self.assertEqual(tipos_de(self.cfg)["DEV"], "NC")
+
     def test_reenviar_um_documento_que_o_estado_da_como_enviado(self):
         self.fonte.docs = [doc("A", "FA", 1, 2500), doc("B", "FA", 2, 900)]
         self.fonte.linhas_ = {"A": [linha("A", "MO", 1, 2500)], "B": [linha("B", "MO", 1, 900)]}
@@ -153,7 +180,8 @@ class SincronizadorTest(unittest.TestCase):
         p = self.api.pedidos[0]
         self.assertEqual(p["documento"], {
             "id": "A", "tipo": "FT", "numero": "FA 2026/1", "data": "2026-10-01", "vencimento": "2026-10-31",
-            "total": 21275, "desconto_financeiro": 0, "metodo_pagamento": "20", "origem_id": None})
+            "total": 21275, "desconto_financeiro": 0, "metodo_pagamento": "20", "origem_id": None,
+            "origem_numero": None})
         self.assertEqual(p["cliente"], {"codigo": "C001", "nome": "Oficina Lima, Lda", "nif": "212345678",
                                         "morada": "Rua A, Praia", "telefone": "9912345", "coletivo": True})
         self.assertEqual(p["linhas"][0], {"artigo": "PNEU", "descricao": "Artigo PNEU", "quantidade": 2,

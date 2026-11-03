@@ -6,7 +6,8 @@ from primavera_sync.esquema import ErroEsquema, Esquema
 from primavera_sync.evolution import Evolution, estrutura_mudou
 
 CABEC = ["Id", "TipoDoc", "Serie", "NumDoc", "Data", "DataVenc", "Entidade", "TipoEntidade", "CondPag", "ModoPag",
-         "Moeda", "TotalDocumento", "DescFinanceiro", "Nome", "NumContribuinte", "Morada", "Localidade"]
+         "Moeda", "TotalDocumento", "DescFinanceiro", "Nome", "NumContribuinte", "Morada", "Localidade",
+         "RefTipoDocOrig", "RefSerieDocOrig", "RefDocOrig"]
 LINHAS = ["Id", "IdCabecDoc", "NumLinha", "Artigo", "Descricao", "Quantidade", "PrecoLiquido", "TaxaIva", "IdLinhaOrigemCopia"]
 
 
@@ -54,6 +55,29 @@ class DocumentosTest(unittest.TestCase):
         c = esquema.documentos(base(CabecDoc=[x for x in CABEC if x not in ("DataVenc", "DescFinanceiro")]))
         self.assertIn("NULL AS [DataVenc]", c.sql)
         self.assertIn("NULL AS [DescFinanceiro]", c.sql)
+
+    def test_vencimento_vem_dos_pendentes_e_da_condicao_quando_o_cabecalho_nao_o_tem(self):
+        cab = [x for x in CABEC if x != "DataVenc"]
+        e = base(CabecDoc=cab, Pendentes=["TipoDoc", "Serie", "NumDocInt", "DataVenc", "ValorPendente"],
+                 CondPag=["CondPag", "Descricao", "Dias", "TipoCondicao"])
+        c = esquema.documentos(e)
+        self.assertNotIn("NULL AS [DataVenc]", c.sql)
+        self.assertIn("SELECT MIN(p.[DataVenc])", c.sql)
+        self.assertIn("p.[NumDocInt] = c.[NumDoc]", c.sql)
+        self.assertIn("DATEADD(day, cp.[Dias], c.[Data])", c.sql)
+        self.assertIn("LEFT JOIN [dbo].[CondPag] cp ON cp.[CondPag] = c.[CondPag]", c.sql)
+        self.assertIn("AS [DataVenc]", c.sql)
+
+    def test_vencimento_so_com_os_pendentes(self):
+        cab = [x for x in CABEC if x != "DataVenc"]
+        c = esquema.documentos(base(CabecDoc=cab, Pendentes=["TipoDoc", "Serie", "NumDocInt", "DataVenc"]))
+        self.assertIn("SELECT MIN(p.[DataVenc])", c.sql)
+        self.assertNotIn("LEFT JOIN [dbo].[CondPag]", c.sql)
+
+    def test_cabecalho_com_vencimento_nao_mexe_em_nada(self):
+        c = esquema.documentos(base(Pendentes=["TipoDoc", "Serie", "NumDocInt", "DataVenc"]))
+        self.assertIn("c.[DataVenc] AS [DataVenc]", c.sql)
+        self.assertNotIn("MIN(p.", c.sql)
 
     def test_obrigatorio_em_falta_diz_qual(self):
         with self.assertRaises(ErroEsquema) as cm:

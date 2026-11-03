@@ -217,7 +217,7 @@ class Sincronizador:
     def __init__(self, fonte, lonntra, estado, cfg):
         self.fonte, self.lonntra, self.estado, self.cfg = fonte, lonntra, estado, cfg
         self.s = cfg["sincronizacao"]
-        self.tipos = {k.upper(): v.strip().upper() for k, v in cfg["tipos_documento"].items()}  # FA = FT
+        self.tipos = tipos_de(cfg)  # FA = FT
         self.modos = {k.upper(): v.strip() for k, v in cfg["modos_pagamento"].items()} if cfg.has_section("modos_pagamento") else {}
         self.erro_catalogo = None
         self.erro_recebimentos = None
@@ -618,6 +618,8 @@ class Sincronizador:
                 "desconto_financeiro": _num(d.get("DescFinanceiro")),
                 "metodo_pagamento": self.modos.get(_txt(d.get("ModoPag")).upper()),
                 "origem_id": origens.pop() if len(origens) == 1 else None,
+                # as notas de crédito e as devoluções do Primavera dizem a fatura de origem no cabeçalho, não nas linhas
+                "origem_numero": _origem_numero(d),
             },
             "cliente": {
                 "codigo": d["Entidade"],
@@ -637,6 +639,25 @@ class Sincronizador:
                 "servico": _txt(artigos.get(l["Artigo"], {}).get("TipoArtigo")) in servicos,
             } for l in linhas if _num(l["Quantidade"]) != 0],
         }
+
+
+DEVOLUCOES = {"DEV": "DV", "DV": "DV"}  # as devoluções do Primavera são notas de devolução na Lonntra
+
+
+def tipos_de(cfg):
+    """{tipo no Primavera: tipo na Lonntra}. As devoluções (DEV, DV) vão sempre, salvo [sincronizacao] devolucoes = nao ou se a
+    empresa já as mapeou de outra forma em [tipos_documento]."""
+    tipos = {k.upper(): v.strip().upper() for k, v in cfg["tipos_documento"].items()}
+    if _txt(cfg["sincronizacao"].get("devolucoes", "sim")).lower() not in ("nao", "não", "no", "false", "0", "off"):
+        for k, v in DEVOLUCOES.items():
+            tipos.setdefault(k, v)
+    return tipos
+
+
+def _origem_numero(d):
+    """«FR 2026/418» a partir de RefTipoDocOrig, RefSerieDocOrig e RefDocOrig do cabeçalho; None se não houver."""
+    tipo, serie, num = _txt(d.get("RefTipo")).upper(), _txt(d.get("RefSerie")), _txt(d.get("RefNum"))
+    return f"{tipo} {serie}/{num}" if tipo and serie and num else None
 
 
 def opcoes_de(cfg):
@@ -738,7 +759,7 @@ def verificar(cfg):
         print(f"  ERRO ligação: {e}")
         return False
     s = cfg["sincronizacao"]
-    tipos = [k.upper() for k in cfg["tipos_documento"]]
+    tipos = list(tipos_de(cfg))
     semana = date.today() - timedelta(days=7)
     passo(f"documentos {', '.join(tipos)} (últimos 7 dias)", lambda: f"{len(fonte.documentos(tipos, semana))} documentos")
     passo("linhas e clientes", lambda: _amostra(fonte, tipos))

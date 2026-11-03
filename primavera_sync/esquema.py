@@ -99,6 +99,30 @@ class Esquema:
 
 # ---------------------------------------------------------------- documentos, linhas, clientes
 
+def _vencimento(e, cab, m):
+    """(expressão SQL do vencimento, JOIN que ela precisa) quando o cabeçalho dos documentos não tem a coluna. Por esta ordem:
+    o vencimento do pendente (o que falta pagar, o exato) e, se o documento já está pago e o pendente desapareceu, a data mais
+    os dias da condição de pagamento (só as condições simples: «30 dias», «pronto pagamento»). Senão NULL (a Lonntra usa a data)."""
+    partes, juntar = [], ""
+    pend = e.tabela(["Pendentes"])
+    p_tipo, p_serie = e.coluna(pend, ["TipoDoc"], False), e.coluna(pend, ["Serie"], False)
+    p_num, p_venc = e.coluna(pend, ["NumDocInt", "NumDoc"], False), e.coluna(pend, ["DataVenc", "DataVencimento"], False)
+    if pend and p_tipo and p_serie and p_num and p_venc:
+        partes.append(f"(SELECT MIN(p.[{p_venc}]) FROM [{pend.esquema}].[{pend.nome}] p WHERE p.[{p_tipo}] = c.[{m['TipoDoc']}] "
+                      f"AND p.[{p_serie}] = c.[{m['Serie']}] AND p.[{p_num}] = c.[{m['NumDoc']}])")
+    cond = e.tabela(["CondPag", "CondicoesPagamento"])
+    cab_cond = e.coluna(cab, ["CondPag", "CondicaoPagamento"], False)
+    k_cond, k_dias, k_tipo = e.coluna(cond, ["CondPag"], False), e.coluna(cond, ["Dias"], False), e.coluna(cond, ["TipoCondicao"], False)
+    if cond and cab_cond and k_cond and k_dias and k_tipo:
+        juntar = f"LEFT JOIN [{cond.esquema}].[{cond.nome}] cp ON cp.[{k_cond}] = c.[{cab_cond}]"
+        partes.append(f"CASE WHEN cp.[{k_tipo}] = 0 THEN DATEADD(day, cp.[{k_dias}], c.[{m['Data']}]) END")
+    if not partes:
+        e.notas.append("não encontrei onde o Primavera guarda o vencimento das faturas: a Lonntra usa a data do documento")
+        return None, ""
+    e.notas.append("o vencimento vem dos pendentes e, nos pagos, da condição de pagamento (o cabeçalho não o tem)")
+    return "COALESCE(" + ", ".join(partes) + ")", juntar
+
+
 def documentos(e):
     t = e.exigir("cabeçalhos de documentos", ["CabecDoc"])
     sel, faltam, m = e.selecionar(t, "c", [
@@ -119,6 +143,10 @@ def documentos(e):
         ("NifDoc", ["NumContribuinte"], False),
         ("MoradaDoc", ["Morada"], False),
         ("LocalDoc", ["Localidade"], False),
+        # a fatura que a nota corrige (notas de crédito e devoluções): o cabeçalho guarda tipo, série e número dela
+        ("RefTipo", ["RefTipoDocOrig"], False),
+        ("RefSerie", ["RefSerieDocOrig"], False),
+        ("RefNum", ["RefDocOrig"], False),
     ])
     e._faltam(t, faltam)
 
@@ -144,6 +172,12 @@ def documentos(e):
         onde.append(f"COALESCE(c.[{e.coluna(t, ['Anulado'])}], 0) = 0")
     else:
         e.notas.append("não encontrei onde o Primavera marca os documentos anulados: podem ir anulados")
+
+    if "DataVenc" not in m:  # o cabeçalho não tem o vencimento: está nos pendentes (o que falta pagar) ou vem dos dias da condição
+        venc, juntar_cond = _vencimento(e, t, m)
+        if venc:
+            sel = [f"{venc} AS [DataVenc]" if x == "NULL AS [DataVenc]" else x for x in sel]
+            juntar = f"{juntar} {juntar_cond}".strip()
 
     ordem = ", ".join(f"c.[{m[k]}]" for k in ("Data", "TipoDoc", "Serie", "NumDoc"))
     sql = (f"SELECT {', '.join(sel)} FROM [{t.esquema}].[{t.nome}] c {juntar} WHERE {' AND '.join(onde)} "
