@@ -402,6 +402,19 @@ class CatalogoTest(unittest.TestCase):
         self.assertIn("M1", enviados, "a recusa antiga não o impede de seguir")
         self.assertEqual(self.estado.marca("recusas_movimentos_servicos"), "1")
 
+    def test_erros_antigos_de_itens_ja_aceites_desaparecem(self):
+        """Versões antigas não apagavam o erro quando o item passava a ser aceite: ficava «com erros» para sempre."""
+        self.estado.guardar_catalogo("existencia", {"PN195|A1": "8.0000"})
+        self.estado.guardar_catalogo("artigo", {"PN195": "h"})
+        self.estado.guardar_catalogo("movimento", {"M1": ""})
+        self.estado.erro("existencia:PN195@A1", "existencia PN195@A1", "o artigo não está na Lonntra")
+        self.estado.erro("artigo:PN195", "artigo PN195", "sem IVA")
+        self.estado.erro("movimento:M1", "movimento M1", "x")
+        self.estado.erro("existencia:OUTRO@A1", "existencia OUTRO@A1", "continua recusado")  # não está no catálogo: fica
+        self.estado.erro("FA 2026/1", "FA 2026/1", "documento com erro")  # documentos não se tocam
+        self.assertEqual(self.estado.limpar_erros_resolvidos(), 3)
+        self.assertEqual(sorted(e[0] for e in self.estado.resumo()[1]), ["FA 2026/1", "existencia OUTRO@A1"])
+
     def test_existencia_aceite_depois_apaga_o_erro_dela(self):
         self.fonte.existencias_ = [{"Artigo": "PN195", "Armazem": "A1", "Quantidade": 3}]
         self.estado.erro("existencia:PN195@A1", "existencia PN195@A1", "o artigo não está na Lonntra")

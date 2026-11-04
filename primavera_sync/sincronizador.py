@@ -157,6 +157,19 @@ class Estado:
             self.conn.executemany("INSERT OR REPLACE INTO catalogo VALUES (?,?,?)", [(tipo, k, v) for k, v in valores.items()])
             self.conn.executemany("DELETE FROM erros WHERE documento=?", [(f"{tipo}:{k}",) for k in valores])
 
+    def limpar_erros_resolvidos(self):
+        """Apaga os erros de artigos, existências e movimentos que entretanto já foram aceites (estão no catálogo). Versões antigas
+        não os apagavam ao serem aceites, e ficavam a contar como «com erros» para sempre. Devolve quantos apagou."""
+        n = 0
+        with self.conn:
+            for tipo, troca in (("artigo", False), ("movimento", False), ("existencia", True)):
+                inicio = len(tipo) + 2  # «tipo:» tem len(tipo)+1 caracteres; o SQL conta a partir de 1
+                chave = f"REPLACE(SUBSTR(documento, {inicio}), '@', '|')" if troca else f"SUBSTR(documento, {inicio})"
+                n += self.conn.execute(
+                    f"DELETE FROM erros WHERE documento LIKE ? AND {chave} IN (SELECT chave FROM catalogo WHERE tipo = ?)",
+                    (f"{tipo}:%", tipo)).rowcount
+        return n
+
     def marca(self, chave):
         r = self.conn.execute("SELECT valor FROM marcas WHERE chave=?", (chave,)).fetchone()
         return r[0] if r else None
@@ -357,6 +370,9 @@ class Sincronizador:
     def catalogo(self, completo=False, limite=None):
         """Envia os artigos, armazéns, movimentos e existências que mudaram desde o último envio.
         `limite`: no máximo tantos de cada (teste de envio); não conta como carga completa."""
+        n = self.estado.limpar_erros_resolvidos()
+        if n:
+            log.info("%d erro(s) antigo(s) já resolvido(s) apagado(s).", n)
         r = {"artigos": self._artigos(limite)}
         r.update(self._stock(completo, limite))
         if any(r.values()):
