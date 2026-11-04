@@ -23,7 +23,7 @@ from . import __version__
 PASTA = Path(__file__).resolve().parent.parent
 LOGIN = "lonntra_leitura"
 DRIVERS = ["ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server", "SQL Server Native Client 11.0", "SQL Server"]
-TIPOS_LONNTRA = ["FT", "FR", "TV", "NC", "ND"]
+TIPOS_LONNTRA = ["FT", "FR", "TV", "NC", "ND", "DV", "FP"]
 METODOS = {"10": "numerário", "20": "cheque", "30": "transferência", "54": "cartão de crédito", "55": "cartão de débito"}
 
 relatorio = []
@@ -34,11 +34,15 @@ relatorio = []
 def sugerir_tipo(codigo, descricao=""):
     """Tipo da Lonntra para um documento do Primavera, ou None se não é uma venda a enviar."""
     c, d = codigo.upper().strip(), _sem_acentos(descricao)
+    if c in ("FP", "PRO", "PF") or "proforma" in d or "pro-forma" in d or "pro forma" in d:  # antes de «fatura»: uma proforma não é uma fatura
+        return "FP"
+    if c in ("DEV", "DV", "NDV") or "devolucao" in d:
+        return "DV"
     if c in ("NC", "NCR") or "nota de credito" in d or "credito" in d and "nota" in d:
         return "NC"
     if c in ("ND",) or "nota de debito" in d:
         return "ND"
-    if c in ("FR", "FRC") or "fatura recibo" in d or "fatura-recibo" in d or "factura recibo" in d or "factura-recibo" in d:
+    if c in ("FR", "FRC") or re.fullmatch(r"FR\d+", c) or "fatura recibo" in d or "fatura-recibo" in d or "factura recibo" in d or "factura-recibo" in d:
         return "FR"
     if c in ("VD", "TV", "FS", "VDI") or "venda a dinheiro" in d or "talao" in d or "simplificada" in d:
         return "TV"
@@ -433,7 +437,7 @@ def passo_codigos(admin, base, cliente):
             mapa_tipos[codigo.strip().upper()] = proposta
         if not sim("Estes tipos estão certos?"):
             for codigo, _, desc in tipos:
-                r = perguntar(f"{codigo} ({(desc or '')[:30]}) -> FT, FR, TV, NC, ND ou vazio", mapa_tipos[codigo.strip().upper()] or "").upper()
+                r = perguntar(f"{codigo} ({(desc or '')[:30]}) -> FT, FR, TV, NC, ND, DV, FP ou vazio", mapa_tipos[codigo.strip().upper()] or "").upper()
                 mapa_tipos[codigo.strip().upper()] = r if r in TIPOS_LONNTRA else None
         mapa_tipos = {k: v for k, v in mapa_tipos.items() if v}
     if not mapa_tipos:

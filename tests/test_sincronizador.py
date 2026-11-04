@@ -151,6 +151,25 @@ class SincronizadorTest(unittest.TestCase):
         origens = {p["documento"]["numero"]: p["documento"]["origem_numero"] for p in self.api.pedidos}
         self.assertEqual(origens, {"NC 2026/1": "FA 2026/35", "NC 2026/2": None})
 
+    def test_proforma_e_fatura_recibo_de_outra_serie_corrigem_o_mapa_antigo(self):
+        from primavera_sync.sincronizador import tipos_de
+        self.cfg["tipos_documento"]["FP"] = "FT"      # como as primeiras instalações fizeram
+        self.cfg["tipos_documento"]["FR1"] = "FT"
+        self.assertEqual((tipos_de(self.cfg)["FP"], tipos_de(self.cfg)["FR1"]), ("FP", "FR"))
+        self.cfg["tipos_documento"]["FP"] = "FP"
+        self.cfg["tipos_documento"]["FR1"] = "TV"      # uma escolha deliberada da empresa não se mexe
+        self.assertEqual((tipos_de(self.cfg)["FP"], tipos_de(self.cfg)["FR1"]), ("FP", "TV"))
+
+    def test_reenviar_um_tipo_revê_todos_os_documentos_dele(self):
+        self.fonte.docs = [doc("A", "FA", 1, 2500), doc("B", "FA", 2, 900), doc("C", "NC", 1, -100)]
+        self.fonte.linhas_ = {"A": [linha("A", "MO", 1, 2500)], "B": [linha("B", "MO", 1, 900)], "C": [linha("C", "MO", -1, -100)]}
+        self.s.ciclo()
+        n = len(self.api.pedidos)
+        texto = self.s.reenviar_documento("FA")
+        self.assertIn("2 documento(s) revistos", texto)
+        self.assertEqual(len(self.api.pedidos), n + 2, "só os FA, não a NC")
+        self.assertIn("não é um tipo", self.s.reenviar_documento("GR"))
+
     def test_devolucoes_podem_desligar_se_ou_mapear_se_de_outra_forma(self):
         from primavera_sync.sincronizador import tipos_de
         self.cfg["sincronizacao"]["devolucoes"] = "nao"

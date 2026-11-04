@@ -154,8 +154,8 @@ def validar_comando(comando, args):
     regra = COMANDOS[comando]
     if regra == "documento":  # «FP 2025/1»: tipo, série/número. Nada mais passa
         texto = " ".join(str(args or "").split())
-        if not re.fullmatch(r"[A-Z][A-Z0-9]{0,5} [A-Za-z0-9]{1,10}/\d{1,9}", texto):
-            raise ValueError("o argumento tem de ser um documento, ex.: FP 2025/1")
+        if not re.fullmatch(r"[A-Z][A-Z0-9]{0,5}( [A-Za-z0-9]{1,10}/\d{1,9})?", texto):
+            raise ValueError("o argumento tem de ser um documento (FP 2025/1) ou um tipo (FP)")
         return texto
     if regra is None:
         if str(args or "").strip():

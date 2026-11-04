@@ -511,6 +511,8 @@ class Sincronizador:
 
     def reenviar_documento(self, numero):
         """Reenvia UM documento («FP 2025/1») mesmo que o estado local o dê como enviado (a Lonntra não o tem). Devolve o resultado em texto."""
+        if " " not in numero:  # só o tipo («FP»): reenvia todos os documentos desse tipo (ex.: depois de mudar o tipo na Lonntra)
+            return self._reenviar_tipo(numero)
         tipo, resto = numero.split(" ", 1)
         serie, num = resto.split("/", 1)
         alvo = [d for d in self.fonte.documentos([tipo], date(1900, 1, 1))
@@ -525,6 +527,15 @@ class Sincronizador:
             return f"«{numero}» reenviado: a Lonntra aceitou."
         motivo = self.estado.conn.execute("SELECT mensagem FROM erros WHERE documento=?", (d["Id"],)).fetchone()
         return f"«{numero}» NÃO foi aceite: {motivo[0] if motivo else 'sem detalhe'}"
+
+    def _reenviar_tipo(self, tipo):
+        if tipo not in self.tipos:
+            return f"«{tipo}» não é um tipo de documento que este sync envie."
+        docs = self.fonte.documentos([tipo], date(1900, 1, 1))
+        with self.estado.conn:
+            self.estado.conn.executemany("DELETE FROM enviados WHERE documento=?", [(d["Id"],) for d in docs])
+        enviados, erros, _ = self._enviar_documentos(docs)
+        return f"{tipo}: {len(docs)} documento(s) revistos, {enviados} aceites, {erros} com erro."
 
     def _desde_com_erros(self, desde):
         """A janela de revisão alarga-se até ao documento com erro mais antigo: um documento recusado e corrigido depois
@@ -641,6 +652,7 @@ class Sincronizador:
         }
 
 
+CORRECOES = {"FP": ("FT", "FP")}
 DEVOLUCOES = {"DEV": "DV", "DV": "DV"}  # as devoluções do Primavera são notas de devolução na Lonntra
 
 
@@ -648,6 +660,12 @@ def tipos_de(cfg):
     """{tipo no Primavera: tipo na Lonntra}. As devoluções (DEV, DV) vão sempre, salvo [sincronizacao] devolucoes = nao ou se a
     empresa já as mapeou de outra forma em [tipos_documento]."""
     tipos = {k.upper(): v.strip().upper() for k, v in cfg["tipos_documento"].items()}
+    # mapeamentos que as primeiras instalações fizeram mal: a proforma não é uma fatura, e a fatura-recibo de outra série (FR1…) é FR
+    for k, (errado, certo) in CORRECOES.items():
+        if tipos.get(k) == errado:
+            tipos[k] = certo
+    for k in [k for k in tipos if re.fullmatch(r"FR\d+", k) and tipos[k] == "FT"]:
+        tipos[k] = "FR"
     if _txt(cfg["sincronizacao"].get("devolucoes", "sim")).lower() not in ("nao", "não", "no", "false", "0", "off"):
         for k, v in DEVOLUCOES.items():
             tipos.setdefault(k, v)

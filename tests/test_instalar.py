@@ -17,6 +17,9 @@ class SugestoesTest(unittest.TestCase):
             ("FR", "Fatura-Recibo"): "FR", ("XFR", "Factura Recibo"): "FR",
             ("VD", "Venda a Dinheiro"): "TV", ("FS", "Fatura Simplificada"): "TV",
             ("NC", "Nota de Crédito"): "NC", ("NCR", ""): "NC", ("ND", "Nota de Débito"): "ND",
+            ("FP", "Fatura Proforma"): "FP", ("PRO", "Pro-forma"): "FP", ("XPF", "Factura ProForma"): "FP",
+            ("FR1", "Fatura Recibo (série 1)"): "FR", ("FR2", ""): "FR",
+            ("DEV", "Devolução"): "DV", ("DV", ""): "DV",
             ("GR", "Guia de Remessa"): None, ("ECL", "Encomenda de Cliente"): None, ("ORC", "Orçamento"): None,
         }
         for (codigo, desc), esperado in casos.items():

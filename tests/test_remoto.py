@@ -118,7 +118,8 @@ class ExecutarTest(unittest.TestCase):
 
     def test_reenviar_so_aceita_um_documento(self):
         self.assertEqual(validar_comando("reenviar", " FP  2025/1 "), "FP 2025/1")
-        for mau in ("", "FP", "fp 2025/1", "FP 2025/1; DROP", "FP 2025/1 FP 2025/2", "../x", "FP 2025/"):
+        self.assertEqual(validar_comando("reenviar", "FP"), "FP")   # só o tipo: todos os documentos dele
+        for mau in ("", "fp", "fp 2025/1", "FP 2025/1; DROP", "FP 2025/1 FP 2025/2", "../x", "FP 2025/"):
             with self.assertRaises(ValueError):
                 validar_comando("reenviar", mau)
 
