@@ -511,19 +511,43 @@ class Sincronizador:
         desde, carga = self._historico("documentos", completo)
 
         feitos, em_espera = self.estado.enviados(), self.estado.em_espera()
-        docs = [d for d in self.fonte.documentos(list(self.tipos), self._desde_com_erros(desde))
-                if d["Id"] not in feitos and d["Id"] not in em_espera]
-        if not docs:
-            if carga:
-                self._carga_feita("documentos")
-            log.info("Nada de novo no Primavera.")
-            return {"documentos": 0, "erros": 0}
-        log.info("%d documento(s) por enviar%s.", len(docs), f" desde {desde}" if desde else "")
-        enviados, erros, _ = self._enviar_documentos(docs)
+        encontrados = self.fonte.documentos(list(self.tipos), self._desde_com_erros(desde))
+        # um tipo que passou a seguir depois da carga completa (ex.: as guias de remessa) também tem o seu histórico, uma vez
+        novos = [] if carga else self._tipos_sem_historico()
+        if novos and self._na_janela():
+            inicio = self.s.get("data_inicio", "").strip()
+            log.info("Histórico dos tipos novos: %s.", ", ".join(novos))
+            encontrados += self.fonte.documentos(novos, date.fromisoformat(inicio) if inicio else None)
+        else:
+            novos = []
+        vistos = set()
+        docs = [d for d in encontrados if d["Id"] not in feitos and d["Id"] not in em_espera
+                and not (d["Id"] in vistos or vistos.add(d["Id"]))]
+        enviados = erros = 0
+        if docs:
+            log.info("%d documento(s) por enviar%s.", len(docs), f" desde {desde}" if desde else "")
+            enviados, erros, _ = self._enviar_documentos(docs)
         if carga:
             self._carga_feita("documentos")
+        if carga or novos:
+            self.estado.marcar_marca("tipos_com_historico", ",".join(sorted(self.tipos)))
+        if not docs:
+            log.info("Nada de novo no Primavera.")
+            return {"documentos": 0, "erros": 0}
         log.info("Ciclo terminado: %d enviado(s), %d com erro.", enviados, erros)
         return {"documentos": enviados, "erros": erros}
+
+    def _tipos_sem_historico(self):
+        """Tipos que seguem agora mas cujo histórico nunca foi enviado. Nas instalações de antes desta marca, o histórico
+        feito foi o dos tipos escritos no config.ini ([tipos_documento]); os que só vêm por omissão (guias) ainda não."""
+        marca = self.estado.marca("tipos_com_historico")
+        if marca is None:
+            if self.estado.marca("carga_documentos") is None:
+                return []  # a carga completa ainda não se fez: os tipos novos vão nela
+            feitos = {k.upper() for k in self.cfg["tipos_documento"]}
+        else:
+            feitos = set(marca.split(","))
+        return sorted(t for t in self.tipos if t not in feitos)
 
     def reenviar_documento(self, numero):
         """Reenvia UM documento («FP 2025/1») mesmo que o estado local o dê como enviado (a Lonntra não o tem). Devolve o resultado em texto."""
@@ -670,11 +694,16 @@ class Sincronizador:
 
 CORRECOES = {"FP": ("FT", "FP")}
 DEVOLUCOES = {"DEV": "DV", "DV": "DV"}  # as devoluções do Primavera são notas de devolução na Lonntra
+GUIAS = {"GR": "DT"}  # as guias de remessa são documentos de transporte na Lonntra
+
+
+def _ligado(cfg, opcao):
+    return _txt(cfg["sincronizacao"].get(opcao, "sim")).lower() not in ("nao", "não", "no", "false", "0", "off")
 
 
 def tipos_de(cfg):
-    """{tipo no Primavera: tipo na Lonntra}. As devoluções (DEV, DV) vão sempre, salvo [sincronizacao] devolucoes = nao ou se a
-    empresa já as mapeou de outra forma em [tipos_documento]."""
+    """{tipo no Primavera: tipo na Lonntra}. As devoluções (DEV, DV) e as guias de remessa (GR) vão sempre, salvo
+    [sincronizacao] devolucoes = nao / guias = nao, ou se a empresa já as mapeou de outra forma em [tipos_documento]."""
     tipos = {k.upper(): v.strip().upper() for k, v in cfg["tipos_documento"].items()}
     # mapeamentos que as primeiras instalações fizeram mal: a proforma não é uma fatura, e a fatura-recibo de outra série (FR1…) é FR
     for k, (errado, certo) in CORRECOES.items():
@@ -682,9 +711,10 @@ def tipos_de(cfg):
             tipos[k] = certo
     for k in [k for k in tipos if re.fullmatch(r"FR\d+", k) and tipos[k] == "FT"]:
         tipos[k] = "FR"
-    if _txt(cfg["sincronizacao"].get("devolucoes", "sim")).lower() not in ("nao", "não", "no", "false", "0", "off"):
-        for k, v in DEVOLUCOES.items():
-            tipos.setdefault(k, v)
+    for opcao, omissao in (("devolucoes", DEVOLUCOES), ("guias", GUIAS)):
+        if _ligado(cfg, opcao):
+            for k, v in omissao.items():
+                tipos.setdefault(k, v)
     return tipos
 
 

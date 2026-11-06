@@ -23,7 +23,7 @@ from . import __version__
 PASTA = Path(__file__).resolve().parent.parent
 LOGIN = "lonntra_leitura"
 DRIVERS = ["ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server", "SQL Server Native Client 11.0", "SQL Server"]
-TIPOS_LONNTRA = ["FT", "FR", "TV", "NC", "ND", "DV", "FP"]
+TIPOS_LONNTRA = ["FT", "FR", "TV", "NC", "ND", "DV", "FP", "DT"]
 METODOS = {"10": "numerário", "20": "cheque", "30": "transferência", "54": "cartão de crédito", "55": "cartão de débito"}
 
 relatorio = []
@@ -38,6 +38,8 @@ def sugerir_tipo(codigo, descricao=""):
         return "FP"
     if c in ("DEV", "DV", "NDV") or "devolucao" in d:
         return "DV"
+    if c in ("GR", "GT") or re.search(r"\bguia (de )?(remessa|transporte)\b", d):  # documentos de transporte na Lonntra
+        return "DT"
     if c in ("NC", "NCR") or "nota de credito" in d or "credito" in d and "nota" in d:
         return "NC"
     if c in ("ND",) or "nota de debito" in d:

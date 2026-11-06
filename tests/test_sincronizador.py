@@ -168,7 +168,34 @@ class SincronizadorTest(unittest.TestCase):
         texto = self.s.reenviar_documento("FA")
         self.assertIn("2 documento(s) revistos", texto)
         self.assertEqual(len(self.api.pedidos), n + 2, "só os FA, não a NC")
-        self.assertIn("não é um tipo", self.s.reenviar_documento("GR"))
+        self.assertIn("não é um tipo", self.s.reenviar_documento("ECL"))
+
+    def test_guias_de_remessa_vao_como_documentos_de_transporte(self):
+        self.assertEqual(self.s.tipos["GR"], "DT")
+        self.fonte.docs = [doc("A", "GR", 31, 2875)]
+        self.fonte.linhas_ = {"A": [linha("A", "PNEU", 1, 2500)]}
+        self.assertEqual(self.s.ciclo(), {"documentos": 1, "erros": 0})
+        corpo = self.api.pedidos[-1]["documento"]
+        self.assertEqual((corpo["tipo"], corpo["numero"]), ("DT", "GR 2026/31"))
+        from primavera_sync.sincronizador import tipos_de
+        self.cfg["sincronizacao"]["guias"] = "nao"
+        self.assertNotIn("GR", tipos_de(self.cfg))
+
+    def test_tipo_novo_depois_da_carga_completa_tem_o_seu_historico_uma_vez(self):
+        # uma instalação antiga: o histórico feito foi o dos tipos do config.ini, sem as guias
+        self.estado.marcar_marca("carga_documentos", "tudo")
+        self.fonte.docs = [doc("A", "FA", 1, 2500, data=date(2019, 1, 1)), doc("G", "GR", 1, 2500, data=date(2019, 1, 1))]
+        self.fonte.linhas_ = {"A": [linha("A", "MO", 1, 2500)], "G": [linha("G", "PNEU", 1, 2500)]}
+        self.cfg["sincronizacao"]["historico_horario"] = "20-7"
+        with mock.patch.object(self.s, "_na_janela", return_value=False):
+            self.assertEqual(self.s.ciclo()["documentos"], 0, "de dia: o histórico das guias espera pela noite")
+        with mock.patch.object(self.s, "_na_janela", return_value=True):
+            self.assertEqual(self.s.ciclo()["documentos"], 1)
+        self.assertEqual([p["documento"]["numero"] for p in self.api.pedidos], ["GR 2026/1"], "a FA antiga não: já tinha tido a sua carga")
+        self.fonte.docs.append(doc("H", "GR", 2, 900, data=date(2019, 2, 1)))
+        self.fonte.linhas_["H"] = [linha("H", "PNEU", 1, 900)]
+        with mock.patch.object(self.s, "_na_janela", return_value=True):
+            self.assertEqual(self.s.ciclo()["documentos"], 0, "o histórico do tipo novo faz-se uma vez")
 
     def test_devolucoes_podem_desligar_se_ou_mapear_se_de_outra_forma(self):
         from primavera_sync.sincronizador import tipos_de
@@ -286,7 +313,7 @@ class SincronizadorTest(unittest.TestCase):
         self.assertEqual(self.s.ciclo()["documentos"], 1)
 
     def test_tipos_nao_configurados_e_outras_moedas_nao_vao(self):
-        self.fonte.docs = [doc("G", "GR", 1, 100), {**doc("E", "FA", 2, 100), "Moeda": "EUR"}]
+        self.fonte.docs = [doc("G", "ECL", 1, 100), {**doc("E", "FA", 2, 100), "Moeda": "EUR"}]
         self.fonte.linhas_ = {"E": [linha("E", "PNEU", 1, 87)]}
         self.assertEqual(self.s.ciclo(), {"documentos": 0, "erros": 1})
         self.assertEqual(self.api.pedidos, [])

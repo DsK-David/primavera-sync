@@ -20,7 +20,8 @@ class SugestoesTest(unittest.TestCase):
             ("FP", "Fatura Proforma"): "FP", ("PRO", "Pro-forma"): "FP", ("XPF", "Factura ProForma"): "FP",
             ("FR1", "Fatura Recibo (série 1)"): "FR", ("FR2", ""): "FR",
             ("DEV", "Devolução"): "DV", ("DV", ""): "DV",
-            ("GR", "Guia de Remessa"): None, ("ECL", "Encomenda de Cliente"): None, ("ORC", "Orçamento"): None,
+            ("GR", "Guia de Remessa"): "DT", ("GT", "Guia Transporte"): "DT", ("GRX", "Guia Remessa"): "DT",
+            ("ECL", "Encomenda de Cliente"): None, ("ORC", "Orçamento"): None,
         }
         for (codigo, desc), esperado in casos.items():
             self.assertEqual(instalar.sugerir_tipo(codigo, desc), esperado, codigo)
